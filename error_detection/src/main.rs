@@ -1,6 +1,8 @@
 mod daemon;
+mod db;
 mod netlink;
 mod notify;
+mod output_capture;
 
 use std::collections::HashSet;
 use std::env;
@@ -13,11 +15,14 @@ use daemon::{
     daemonize, install_signal_handlers, is_shutdown_requested, log_message, read_running_pid,
     remove_pid_file, stop_daemon, write_pid_file,
 };
+use db::ErrorDatabase;
 use netlink::{ProcEventMonitor, ProcessExitEvent};
 use notify::DesktopSession;
+use output_capture::OutputCollector;
 
 const DEFAULT_PID_FILE: &str = "/tmp/error_detection.pid";
 const DEFAULT_LOG_FILE: &str = "/tmp/error_detection.log";
+const DEFAULT_DB_FILE: &str = "/tmp/error_detection.db";
 
 #[derive(Debug, PartialEq, Eq)]
 enum Action {
@@ -25,6 +30,7 @@ enum Action {
     RunForeground,
     Stop,
     Status,
+    Logs,
     TestNotify,
     Help,
 }
@@ -33,6 +39,7 @@ struct Config {
     action: Action,
     pid_file: PathBuf,
     log_file: PathBuf,
+    db_file: PathBuf,
     ignored_comms: HashSet<String>,
 }
 
@@ -45,7 +52,10 @@ impl Config {
         let mut log_file = PathBuf::from(
             env::var("ERROR_DETECTION_LOG_FILE").unwrap_or_else(|_| DEFAULT_LOG_FILE.to_string()),
         );
-        let mut ignored_comms: HashSet<String> = ["notify-send", "gdbus"]
+        let mut db_file = PathBuf::from(
+            env::var("ERROR_DETECTION_DB_FILE").unwrap_or_else(|_| DEFAULT_DB_FILE.to_string()),
+        );
+        let mut ignored_comms: HashSet<String> = ["notify-send", "gdbus", "journalctl"]
             .into_iter()
             .map(String::from)
             .collect();
@@ -57,6 +67,7 @@ impl Config {
                 "run" | "foreground" | "-f" | "--foreground" => action = Action::RunForeground,
                 "stop" => action = Action::Stop,
                 "status" => action = Action::Status,
+                "logs" => action = Action::Logs,
                 "test-notify" => action = Action::TestNotify,
                 "-h" | "--help" | "help" => action = Action::Help,
                 "--pid-file" => {
@@ -70,6 +81,12 @@ impl Config {
                         .next()
                         .ok_or_else(|| "--log-file requires a path argument".to_string())?;
                     log_file = PathBuf::from(val);
+                }
+                "--db-file" => {
+                    let val = args
+                        .next()
+                        .ok_or_else(|| "--db-file requires a path argument".to_string())?;
+                    db_file = PathBuf::from(val);
                 }
                 "--ignore" => {
                     let val = args
@@ -89,6 +106,7 @@ impl Config {
             action,
             pid_file,
             log_file,
+            db_file,
             ignored_comms,
         })
     }
@@ -107,20 +125,22 @@ COMMANDS:
     run, -f         Run in the foreground
     stop            Stop the running background daemon
     status          Show daemon status and recent logs
+    logs            Query logged errors (and stdout/stderr) from the SQLite database
     test-notify     Send a test notification to the device notification service
     help, --help    Show this help message
 
 OPTIONS:
     --pid-file <PATH>       Path to PID file (default: {DEFAULT_PID_FILE})
     --log-file <PATH>       Path to log file (default: {DEFAULT_LOG_FILE})
+    --db-file <PATH>        Path to SQLite database (default: {DEFAULT_DB_FILE})
     --ignore <COMM,...>     Comma-separated process names to ignore
 
 PERMISSIONS:
     Monitoring all system-wide process exits via the Linux Netlink Proc Connector
     requires CAP_NET_ADMIN or root privileges:
       sudo ./target/debug/error_detection start
-    Or grant the capability once to run as a normal user:
-      sudo setcap cap_net_admin+ep ./target/debug/error_detection"
+    Or grant the capabilities once to run as a normal user:
+      sudo setcap cap_net_admin,cap_bpf,cap_perfmon,cap_dac_read_search+ep ./target/debug/error_detection"
     );
 }
 
@@ -138,7 +158,8 @@ fn main() -> ExitCode {
             print_usage();
             ExitCode::SUCCESS
         }
-        Action::Status => cmd_status(&config.pid_file, &config.log_file),
+        Action::Status => cmd_status(&config.pid_file, &config.log_file, &config.db_file),
+        Action::Logs => cmd_logs(&config.db_file),
         Action::Stop => match stop_daemon(&config.pid_file) {
             Ok(pid) => {
                 println!("Stopped error_detection daemon (PID {pid}).");
@@ -181,9 +202,10 @@ fn main() -> ExitCode {
             }
 
             println!(
-                "Starting error_detection daemon (PID file: {}, Log file: {})...",
+                "Starting error_detection daemon (PID file: {}, Log file: {}, DB: {})...",
                 config.pid_file.display(),
-                config.log_file.display()
+                config.log_file.display(),
+                config.db_file.display()
             );
 
             if let Err(err) = daemonize(&config.pid_file, &config.log_file) {
@@ -196,7 +218,10 @@ fn main() -> ExitCode {
         Action::RunForeground => {
             let session = DesktopSession::capture();
             if let Err(err) = write_pid_file(&config.pid_file) {
-                eprintln!("Warning: could not write PID file {}: {err}", config.pid_file.display());
+                eprintln!(
+                    "Warning: could not write PID file {}: {err}",
+                    config.pid_file.display()
+                );
             }
             run_monitor_loop(&config, &session, false)
         }
@@ -214,7 +239,7 @@ fn print_netlink_permission_error(err: &io::Error) {
         eprintln!(
             "Hint: Monitoring system-wide process exits requires root or CAP_NET_ADMIN.\n\
              Run with `sudo` or grant capability with:\n  \
-             sudo setcap cap_net_admin+ep {}",
+             sudo setcap cap_net_admin,cap_bpf,cap_perfmon,cap_dac_read_search+ep {}",
             env::current_exe()
                 .map(|p| p.display().to_string())
                 .unwrap_or_else(|_| "error_detection".to_string())
@@ -222,14 +247,15 @@ fn print_netlink_permission_error(err: &io::Error) {
     }
 }
 
-fn cmd_status(pid_path: &Path, log_path: &Path) -> ExitCode {
+fn cmd_status(pid_path: &Path, log_path: &Path, db_path: &Path) -> ExitCode {
     match read_running_pid(pid_path) {
         Some(pid) => {
             println!("error_detection daemon is RUNNING (PID {pid})");
             println!("  PID file: {}", pid_path.display());
             println!("  Log file: {}", log_path.display());
+            println!("  Database: {}", db_path.display());
             if let Ok(logs) = fs::read_to_string(log_path) {
-                let tail: Vec<&str> = logs.lines().rev().take(10).collect();
+                let tail: Vec<&str> = logs.lines().rev().take(15).collect();
                 if !tail.is_empty() {
                     println!("\nRecent log entries:");
                     for line in tail.into_iter().rev() {
@@ -246,8 +272,70 @@ fn cmd_status(pid_path: &Path, log_path: &Path) -> ExitCode {
     }
 }
 
+fn cmd_logs(db_path: &Path) -> ExitCode {
+    let db = match ErrorDatabase::open(db_path) {
+        Ok(d) => d,
+        Err(err) => {
+            eprintln!("Failed to open database {}: {err}", db_path.display());
+            return ExitCode::FAILURE;
+        }
+    };
+
+    match db.recent_errors(50) {
+        Ok(records) if records.is_empty() => {
+            println!("No process errors recorded since last power on in {}.", db_path.display());
+            ExitCode::SUCCESS
+        }
+        Ok(records) => {
+            for rec in records {
+                println!(
+                    "--------------------------------------------------------------------------------\n\
+                     [ID #{}] ts={} boot={}\n\
+                     Process: '{}' (pid={}, tgid={}, ppid={}) | exit_code={} signal={:?}\n\
+                     Command: {}\n\
+                     Summary: {}\n\
+                     Notification:\n{}\n\
+                     --- STDOUT ---\n{}\n\
+                     --- STDERR ---\n{}",
+                    rec.id,
+                    rec.timestamp,
+                    rec.boot_id,
+                    rec.comm,
+                    rec.pid,
+                    rec.tgid,
+                    rec.parent_pid,
+                    rec.exit_code,
+                    rec.exit_signal,
+                    rec.cmdline,
+                    rec.summary,
+                    rec.notification_body,
+                    if rec.stdout.is_empty() { "<empty>" } else { &rec.stdout },
+                    if rec.stderr.is_empty() { "<empty>" } else { &rec.stderr },
+                );
+            }
+            ExitCode::SUCCESS
+        }
+        Err(err) => {
+            eprintln!("Failed to query error logs: {err}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
 fn run_monitor_loop(config: &Config, session: &DesktopSession, is_daemon: bool) -> ExitCode {
     install_signal_handlers();
+
+    let db = match ErrorDatabase::open(&config.db_file) {
+        Ok(db) => db,
+        Err(err) => {
+            log_message(&format!(
+                "FATAL: Failed to open SQLite database {}: {err}",
+                config.db_file.display()
+            ));
+            remove_pid_file(&config.pid_file);
+            return ExitCode::FAILURE;
+        }
+    };
 
     let mut monitor = match ProcEventMonitor::new() {
         Ok(m) => m,
@@ -263,27 +351,49 @@ fn run_monitor_loop(config: &Config, session: &DesktopSession, is_daemon: bool) 
     };
 
     let self_pid = std::process::id() as i32;
+    let mut output_collector = OutputCollector::new(self_pid as u32);
+
     log_message(&format!(
-        "error_detection started (pid={self_pid}, target_user={:?}, dbus={:?})",
-        session.target_user, session.dbus_address
+        "error_detection started (pid={self_pid}, db={}, ebpf_capture={}, target_user={:?}, dbus={:?})",
+        config.db_file.display(),
+        output_collector.has_ebpf(),
+        session.target_user,
+        session.dbus_address
     ));
 
     while !is_shutdown_requested() {
+        output_collector.poll_ebpf();
+
         match monitor.poll_events() {
             Ok(events) => {
                 for ev in events {
                     if should_notify(&ev, self_pid, &config.ignored_comms) {
                         let (summary, body) = format_exit_notification(&ev);
+                        let (stdout, stderr) = output_collector.collect_for_exit(&ev);
+
                         log_message(&format!(
-                            "Non-zero exit detected: pid={} (tid={}) comm='{}' code={} sig={:?} raw=0x{:x} cmd='{}'",
-                            ev.tgid, ev.pid, ev.comm, ev.exit_code, ev.exit_signal, ev.raw_status, ev.cmdline
+                            "ERROR: {summary} | {} | raw=0x{:x}\n  stdout: {}\n  stderr: {}",
+                            body.replace('\n', ", "),
+                            ev.raw_status,
+                            if stdout.is_empty() { "<empty>" } else { &stdout },
+                            if stderr.is_empty() { "<empty>" } else { &stderr }
                         ));
+
+                        if let Err(err) = db.insert_error(&ev, &summary, &body, &stdout, &stderr) {
+                            log_message(&format!(
+                                "Warning: failed to insert error into database for pid {}: {err}",
+                                ev.tgid
+                            ));
+                        }
+
                         if let Err(err) = session.send_notification(&summary, &body) {
                             log_message(&format!(
                                 "Warning: failed to send desktop notification for pid {}: {err}",
                                 ev.tgid
                             ));
                         }
+                    } else {
+                        output_collector.discard_process(ev.tgid);
                     }
                 }
             }
@@ -302,7 +412,7 @@ fn should_notify(ev: &ProcessExitEvent, daemon_pid: i32, ignored_comms: &HashSet
     if ev.exit_code == 0 {
         return false;
     }
-    // Ignore the daemon itself or direct helper children spawned by the daemon (e.g. notify-send)
+    // Ignore the daemon itself or direct helper children spawned by the daemon (e.g. notify-send, journalctl)
     if ev.tgid == daemon_pid || ev.parent_pid == daemon_pid {
         return false;
     }
@@ -340,11 +450,8 @@ fn format_exit_notification(ev: &ProcessExitEvent) -> (String, String) {
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_should_notify_filters_zero_and_daemon_children() {
-        let ignored: HashSet<String> = ["notify-send"].into_iter().map(String::from).collect();
-
-        let ok_ev = ProcessExitEvent {
+    fn sample_event() -> ProcessExitEvent {
+        ProcessExitEvent {
             pid: 1234,
             tgid: 1234,
             parent_pid: 1,
@@ -353,7 +460,17 @@ mod tests {
             raw_status: 0,
             comm: "my_worker".to_string(),
             cmdline: "my_worker --job 1".to_string(),
-        };
+            stdout_path: None,
+            stderr_path: None,
+            systemd_unit: None,
+        }
+    }
+
+    #[test]
+    fn test_should_notify_filters_zero_and_daemon_children() {
+        let ignored: HashSet<String> = ["notify-send"].into_iter().map(String::from).collect();
+
+        let ok_ev = sample_event();
         assert!(!should_notify(&ok_ev, 999, &ignored));
 
         let err_ev = ProcessExitEvent {
@@ -387,9 +504,50 @@ mod tests {
             raw_status: 2 << 8,
             comm: "backup-job".to_string(),
             cmdline: "/usr/local/bin/backup-job --full".to_string(),
+            stdout_path: None,
+            stderr_path: None,
+            systemd_unit: None,
         };
         let (summary, body) = format_exit_notification(&ev);
         assert_eq!(summary, "Process 'backup-job' (PID 4242) exited with code 2");
         assert!(body.contains("/usr/local/bin/backup-job --full"));
+    }
+
+    #[test]
+    fn test_sqlite_database_insert_and_query() {
+        let db_path = PathBuf::from(format!("/tmp/test_error_detection_{}.db", std::process::id()));
+        let _ = fs::remove_file(&db_path);
+
+        let db = ErrorDatabase::open(&db_path).expect("should open sqlite db");
+        let ev = ProcessExitEvent {
+            pid: 7777,
+            tgid: 7777,
+            parent_pid: 1,
+            exit_code: 13,
+            exit_signal: None,
+            raw_status: 13 << 8,
+            comm: "crashy".to_string(),
+            cmdline: "crashy --now".to_string(),
+            stdout_path: None,
+            stderr_path: None,
+            systemd_unit: None,
+        };
+        let (summary, body) = format_exit_notification(&ev);
+        db.insert_error(&ev, &summary, &body, "hello stdout\nline 2", "fatal stderr\nboom")
+            .expect("should insert error record");
+
+        let rows = db.recent_errors(10).expect("should query recent errors");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].tgid, 7777);
+        assert_eq!(rows[0].exit_code, 13);
+        assert_eq!(rows[0].summary, summary);
+        assert_eq!(rows[0].notification_body, body);
+        assert_eq!(rows[0].stdout, "hello stdout\nline 2");
+        assert_eq!(rows[0].stderr, "fatal stderr\nboom");
+
+        drop(db);
+        let _ = fs::remove_file(&db_path);
+        let _ = fs::remove_file(format!("{}-wal", db_path.display()));
+        let _ = fs::remove_file(format!("{}-shm", db_path.display()));
     }
 }

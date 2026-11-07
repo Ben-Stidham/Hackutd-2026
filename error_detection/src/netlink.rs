@@ -87,10 +87,13 @@ struct SubscriptionRequest {
     mcast_op: u32,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct ProcessMetadata {
     pub comm: String,
     pub cmdline: String,
+    pub stdout_path: Option<String>,
+    pub stderr_path: Option<String>,
+    pub systemd_unit: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -103,6 +106,9 @@ pub struct ProcessExitEvent {
     pub raw_status: u32,
     pub comm: String,
     pub cmdline: String,
+    pub stdout_path: Option<String>,
+    pub stderr_path: Option<String>,
+    pub systemd_unit: Option<String>,
 }
 
 pub struct ProcEventMonitor {
@@ -117,10 +123,10 @@ impl ProcEventMonitor {
             return Err(io::Error::last_os_error());
         }
 
-        // Set a 1-second receive timeout so the daemon loop can check shutdown flags periodically
+        // Set a 200ms receive timeout so the daemon loop can poll eBPF ringbuffers and check shutdown flags
         let tv = Timeval {
-            tv_sec: 1,
-            tv_usec: 0,
+            tv_sec: 0,
+            tv_usec: 200_000,
         };
         unsafe {
             setsockopt(
@@ -349,12 +355,15 @@ impl ProcEventMonitor {
                     .entry(process_tgid)
                     .or_insert_with(|| ProcessMetadata {
                         comm: comm.clone(),
-                        cmdline: String::new(),
+                        ..Default::default()
                     });
                 entry.comm = comm;
                 if entry.cmdline.is_empty() {
                     if let Some(fresh) = read_proc_metadata(process_tgid) {
                         entry.cmdline = fresh.cmdline;
+                        entry.stdout_path = fresh.stdout_path;
+                        entry.stderr_path = fresh.stderr_path;
+                        entry.systemd_unit = fresh.systemd_unit;
                     }
                 }
                 None
@@ -382,10 +391,10 @@ impl ProcEventMonitor {
                     .remove(&process_tgid)
                     .or_else(|| read_proc_metadata(process_tgid));
 
-                let (comm, cmdline) = match cached {
-                    Some(meta) => (meta.comm, meta.cmdline),
-                    None => (format!("pid-{process_tgid}"), String::new()),
-                };
+                let meta = cached.unwrap_or_else(|| ProcessMetadata {
+                    comm: format!("pid-{process_tgid}"),
+                    ..Default::default()
+                });
 
                 // Decode wait(2) status encoded in task->exit_code
                 let low_7 = (raw_exit_code & 0x7f) as i32;
@@ -402,8 +411,11 @@ impl ProcEventMonitor {
                     exit_code,
                     exit_signal,
                     raw_status: raw_exit_code,
-                    comm,
-                    cmdline,
+                    comm: meta.comm,
+                    cmdline: meta.cmdline,
+                    stdout_path: meta.stdout_path,
+                    stderr_path: meta.stderr_path,
+                    systemd_unit: meta.systemd_unit,
                 })
             }
             _ => None,
@@ -446,7 +458,46 @@ pub fn read_proc_metadata(pid: i32) -> Option<ProcessMetadata> {
         _ => String::new(),
     };
 
-    Some(ProcessMetadata { comm, cmdline })
+    let stdout_path = read_regular_fd_target(pid, 1);
+    let stderr_path = read_regular_fd_target(pid, 2);
+    let systemd_unit = read_systemd_unit(pid);
+
+    Some(ProcessMetadata {
+        comm,
+        cmdline,
+        stdout_path,
+        stderr_path,
+        systemd_unit,
+    })
+}
+
+fn read_regular_fd_target(pid: i32, fd: i32) -> Option<String> {
+    let link = fs::read_link(format!("/proc/{pid}/fd/{fd}")).ok()?;
+    let path_str = link.to_str()?;
+    let clean = path_str.strip_suffix(" (deleted)").unwrap_or(path_str);
+    if clean.starts_with('/')
+        && !clean.starts_with("/dev/")
+        && !clean.starts_with("/proc/")
+        && !clean.starts_with("/sys/")
+    {
+        Some(clean.to_string())
+    } else {
+        None
+    }
+}
+
+fn read_systemd_unit(pid: i32) -> Option<String> {
+    let cgroup = fs::read_to_string(format!("/proc/{pid}/cgroup")).ok()?;
+    for line in cgroup.lines() {
+        if let Some(path) = line.split(':').nth(2) {
+            if let Some(unit) = path.rsplit('/').next() {
+                if !unit.is_empty() && (unit.ends_with(".service") || unit.ends_with(".scope")) {
+                    return Some(unit.to_string());
+                }
+            }
+        }
+    }
+    None
 }
 
 #[cfg(test)]
