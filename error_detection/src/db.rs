@@ -125,6 +125,35 @@ impl ErrorDatabase {
         Ok(instance)
     }
 
+    /// Opens an existing database connection for fast read queries without re-running startup migrations.
+    pub fn open_query(db_path: &Path) -> io::Result<Self> {
+        let path_str = db_path.to_str().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "Database path is not valid UTF-8")
+        })?;
+        let c_path = CString::new(path_str)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+
+        let mut db: *mut Sqlite3 = ptr::null_mut();
+        let rc = unsafe { sqlite3_open(c_path.as_ptr(), &mut db) };
+        if rc != SQLITE_OK || db.is_null() {
+            let msg = if !db.is_null() {
+                let err = unsafe { sqlite_error_string(db) };
+                unsafe { sqlite3_close(db) };
+                err
+            } else {
+                format!("sqlite3_open failed with code {rc}")
+            };
+            return Err(io::Error::other(msg));
+        }
+
+        let instance = Self {
+            db,
+            boot_id: String::new(),
+        };
+        let _ = instance.exec_sql("PRAGMA busy_timeout=5000;");
+        Ok(instance)
+    }
+
     fn init_schema(&self) -> io::Result<()> {
         let sql = "\
             PRAGMA journal_mode=WAL;\
@@ -255,29 +284,65 @@ impl ErrorDatabase {
         unsafe {
             sqlite3_bind_int(stmt, 1, limit);
             while sqlite3_step(stmt) == SQLITE_ROW {
-                let sig_val = sqlite3_column_int(stmt, 9);
-                let exit_signal = if sig_val > 0 { Some(sig_val) } else { None };
-                rows.push(ErrorLogRecord {
-                    id: sqlite3_column_int64(stmt, 0),
-                    timestamp: sqlite3_column_int64(stmt, 1),
-                    boot_id: col_string(stmt, 2),
-                    pid: sqlite3_column_int(stmt, 3),
-                    tgid: sqlite3_column_int(stmt, 4),
-                    parent_pid: sqlite3_column_int(stmt, 5),
-                    comm: col_string(stmt, 6),
-                    cmdline: col_string(stmt, 7),
-                    exit_code: sqlite3_column_int(stmt, 8),
-                    exit_signal,
-                    summary: col_string(stmt, 10),
-                    notification_body: col_string(stmt, 11),
-                    stdout: col_string(stmt, 12),
-                    stderr: col_string(stmt, 13),
-                });
+                rows.push(read_row(stmt));
             }
             sqlite3_finalize(stmt);
         }
         rows.reverse();
         Ok(rows)
+    }
+
+    pub fn all_errors(&self) -> io::Result<Vec<ErrorLogRecord>> {
+        let sql = CString::new(
+            "SELECT id, timestamp, boot_id, pid, tgid, parent_pid, comm, cmdline, exit_code, exit_signal, summary, notification_body, stdout, stderr \
+             FROM process_errors ORDER BY id ASC;",
+        )
+        .unwrap();
+
+        let mut stmt: *mut Sqlite3Stmt = ptr::null_mut();
+        let rc = unsafe {
+            sqlite3_prepare_v2(self.db, sql.as_ptr(), -1, &mut stmt, ptr::null_mut())
+        };
+        if rc != SQLITE_OK {
+            return Err(io::Error::other(unsafe { sqlite_error_string(self.db) }));
+        }
+
+        let mut rows = Vec::new();
+        unsafe {
+            while sqlite3_step(stmt) == SQLITE_ROW {
+                rows.push(read_row(stmt));
+            }
+            sqlite3_finalize(stmt);
+        }
+        Ok(rows)
+    }
+
+    pub fn get_error_by_id(&self, id: i64) -> io::Result<Option<ErrorLogRecord>> {
+        let sql = CString::new(
+            "SELECT id, timestamp, boot_id, pid, tgid, parent_pid, comm, cmdline, exit_code, exit_signal, summary, notification_body, stdout, stderr \
+             FROM process_errors WHERE id = ?1 LIMIT 1;",
+        )
+        .unwrap();
+
+        let mut stmt: *mut Sqlite3Stmt = ptr::null_mut();
+        let rc = unsafe {
+            sqlite3_prepare_v2(self.db, sql.as_ptr(), -1, &mut stmt, ptr::null_mut())
+        };
+        if rc != SQLITE_OK {
+            return Err(io::Error::other(unsafe { sqlite_error_string(self.db) }));
+        }
+
+        let record = unsafe {
+            sqlite3_bind_int64(stmt, 1, id);
+            let res = if sqlite3_step(stmt) == SQLITE_ROW {
+                Some(read_row(st mt))
+            } else {
+                None
+            };
+            sqlite3_finalize(stmt);
+            res
+        };
+        Ok(record)
     }
 
     fn exec_sql(&self, sql: &str) -> io::Result<()> {
@@ -305,6 +370,29 @@ impl Drop for ErrorDatabase {
             unsafe {
                 sqlite3_close(self.db);
             }
+        }
+    }
+}
+
+unsafe fn read_row(stmt: *mut Sqlite3Stmt) -> ErrorLogRecord {
+    unsafe {
+        let sig_val = sqlite3_column_int(stmt, 9);
+        let exit_signal = if sig_val > 0 { Some(sig_val) } else { None };
+        ErrorLogRecord {
+            id: sqlite3_column_int64(stmt, 0),
+            timestamp: sqlite3_column_int64(stmt, 1),
+            boot_id: col_string(stmt, 2),
+            pid: sqlite3_column_int(stmt, 3),
+            tgid: sqlite3_column_int(stmt, 4),
+            parent_pid: sqlite3_column_int(stmt, 5),
+            comm: col_string(stmt, 6),
+            cmdline: col_string(stmt, 7),
+            exit_code: sqlite3_column_int(stmt, 8),
+            exit_signal,
+            summary: col_string(stmt, 10),
+            notification_body: col_string(stmt, 11),
+            stdout: col_string(stmt, 12),
+            stderr: col_string(stmt, 13),
         }
     }
 }

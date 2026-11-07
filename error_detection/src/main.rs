@@ -3,6 +3,7 @@ mod db;
 mod netlink;
 mod notify;
 mod output_capture;
+mod server;
 
 use std::collections::HashSet;
 use std::env;
@@ -19,10 +20,12 @@ use db::ErrorDatabase;
 use netlink::{ProcEventMonitor, ProcessExitEvent};
 use notify::DesktopSession;
 use output_capture::OutputCollector;
+use server::HttpServerHandle;
 
 const DEFAULT_PID_FILE: &str = "/tmp/error_detection.pid";
 const DEFAULT_LOG_FILE: &str = "/tmp/error_detection.log";
 const DEFAULT_DB_FILE: &str = "/tmp/error_detection.db";
+const DEFAULT_PORT: u16 = 8080;
 
 #[derive(Debug, PartialEq, Eq)]
 enum Action {
@@ -40,6 +43,7 @@ struct Config {
     pid_file: PathBuf,
     log_file: PathBuf,
     db_file: PathBuf,
+    port: u16,
     ignored_comms: HashSet<String>,
 }
 
@@ -55,6 +59,10 @@ impl Config {
         let mut db_file = PathBuf::from(
             env::var("ERROR_DETECTION_DB_FILE").unwrap_or_else(|_| DEFAULT_DB_FILE.to_string()),
         );
+        let mut port = env::var("ERROR_DETECTION_PORT")
+            .ok()
+            .and_then(|v| v.parse::<u16>().ok())
+            .unwrap_or(DEFAULT_PORT);
         let mut ignored_comms: HashSet<String> = ["notify-send", "gdbus", "journalctl"]
             .into_iter()
             .map(String::from)
@@ -88,6 +96,14 @@ impl Config {
                         .ok_or_else(|| "--db-file requires a path argument".to_string())?;
                     db_file = PathBuf::from(val);
                 }
+                "--port" => {
+                    let val = args
+                        .next()
+                        .ok_or_else(|| "--port requires a port number".to_string())?;
+                    port = val
+                        .parse::<u16>()
+                        .map_err(|_| format!("Invalid port number: '{val}'"))?;
+                }
                 "--ignore" => {
                     let val = args
                         .next()
@@ -107,6 +123,7 @@ impl Config {
             pid_file,
             log_file,
             db_file,
+            port,
             ignored_comms,
         })
     }
@@ -133,7 +150,12 @@ OPTIONS:
     --pid-file <PATH>       Path to PID file (default: {DEFAULT_PID_FILE})
     --log-file <PATH>       Path to log file (default: {DEFAULT_LOG_FILE})
     --db-file <PATH>        Path to SQLite database (default: {DEFAULT_DB_FILE})
+    --port <PORT>           Localhost HTTP server port (default: {DEFAULT_PORT})
     --ignore <COMM,...>     Comma-separated process names to ignore
+
+HTTP API (localhost only):
+    GET http://127.0.0.1:{DEFAULT_PORT}/errors       List all failed processes (id, process_name, error_code)
+    GET http://127.0.0.1:{DEFAULT_PORT}/errors/<id>  Get full stored details for a specific failed process ID
 
 PERMISSIONS:
     Monitoring all system-wide process exits via the Linux Netlink Proc Connector
@@ -353,9 +375,27 @@ fn run_monitor_loop(config: &Config, session: &DesktopSession, is_daemon: bool) 
     let self_pid = std::process::id() as i32;
     let mut output_collector = OutputCollector::new(self_pid as u32);
 
+    let _http_server = match HttpServerHandle::start(config.port, config.db_file.clone()) {
+        Ok(srv) => {
+            log_message(&format!(
+                "HTTP API server listening on http://{} (localhost only)",
+                srv.local_addr
+            ));
+            Some(srv)
+        }
+        Err(err) => {
+            log_message(&format!(
+                "Warning: failed to bind HTTP server on 127.0.0.1:{}: {err}",
+                config.port
+            ));
+            None
+        }
+    };
+
     log_message(&format!(
-        "error_detection started (pid={self_pid}, db={}, ebpf_capture={}, target_user={:?}, dbus={:?})",
+        "error_detection started (pid={self_pid}, db={}, port={}, ebpf_capture={}, target_user={:?}, dbus={:?})",
         config.db_file.display(),
+        config.port,
         output_collector.has_ebpf(),
         session.target_user,
         session.dbus_address
