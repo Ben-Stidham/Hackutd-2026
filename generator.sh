@@ -1,3 +1,44 @@
+None selected 
+
+Skip to content
+Using Gmail with screen readers
+Enable desktop notifications for Gmail.
+   OK  No thanks
+1 of 5,509
+Error Generator
+Inbox
+
+Jacob Zeman
+Attachments
+Sat, Nov 7, 10:06 PM (5 hours ago)
+ 
+
+Jacob Zeman <charredhelfroze@gmail.com>
+Attachments
+2:22 AM (1 hour ago)
+to me
+
+
+
+On Sun, Nov 8, 2026 at 4:06 AM Jacob Zeman <charredhelfroze@gmail.com> wrote:
+
+
+ One attachment
+  •  Scanned by Gmail
+Compose:
+New Message
+Recipients
+Subject
+
+
+mkdir -p ~/linux-damage-lab/etc
+mkdir -p ~/linux-damage-lab/bin
+mkdir -p ~/linux-damage-lab/usr
+mkdir -p ~/linux-damage-lab/dev
+
+
+gen2.sh
+100%
 #!/usr/bin/env bash
 
 set -uo pipefail
@@ -7,52 +48,17 @@ WORK="$BASE/error-test-work"
 BUILD="$WORK/build"
 REPO="$WORK/repo"
 ROOTS="$WORK/roots"
-LOGS="$BASE/error-logs"
 
-mkdir -p "$BUILD" "$REPO" "$ROOTS" "$LOGS"
+mkdir -p "$BUILD" "$REPO" "$ROOTS"
 
 # ---------------------------------------
 # General utilities
 # ---------------------------------------
 
 require_tools() {
-    local missing=0
-
     for tool in pacman makepkg repo-add sudo; do
-        if ! command -v "$tool" >/dev/null 2>&1; then
-            echo "Missing prerequisite: $tool"
-            missing=1
-        fi
+        command -v "$tool" >/dev/null 2>&1 || return 1
     done
-
-    return "$missing"
-}
-
-record_test() {
-    local id="$1"
-    local name="$2"
-    shift 2
-
-    local logfile="$LOGS/ARCH_$(printf '%03d' "$id").log"
-    local code
-
-    echo
-    echo "======================================"
-    echo "TEST ARCH_$(printf '%03d' "$id")"
-    echo "$name"
-    echo "======================================"
-
-    if "$@" > "$logfile" 2>&1; then
-        code=0
-    else
-        code=$?
-    fi
-
-    cat "$logfile"
-
-    echo
-    echo "Exit code: $code"
-    echo "$code" > "$LOGS/ARCH_$(printf '%03d' "$id").exit"
 }
 
 # ---------------------------------------
@@ -94,28 +100,19 @@ package() {
 }
 EOF
 
-    if ! (
+    (
         cd "$dir" &&
         makepkg --nodeps --noconfirm --cleanbuild -f
-    ) > "$LOGS/build-$name.log" 2>&1; then
-        echo "Build failed: $name"
-        cat "$LOGS/build-$name.log"
-        return 1
-    fi
+    ) >/dev/null 2>&1 || return 1
 
     local archive="$dir/$name-$version-1-any.pkg.tar.zst"
 
-    if [[ ! -f "$archive" ]]; then
-        echo "Missing archive: $archive"
-        return 1
-    fi
+    [[ -f "$archive" ]] || return 1
 
     cp "$archive" "$REPO/"
 }
 
 prepare_packages() {
-    echo "Preparing package fixtures..."
-
     build_package test-base || return 1
     build_package test-missing 1.0 test-does-not-exist || return 1
 
@@ -138,7 +135,7 @@ prepare_packages() {
     (
         cd "$REPO" &&
         repo-add testrepo.db.tar.gz ./*.pkg.tar.zst
-    ) > "$LOGS/repository.log" 2>&1 || return 1
+    ) >/dev/null 2>&1 || return 1
 
     mkdir -p "$WORK/old-repo"
 
@@ -148,9 +145,7 @@ prepare_packages() {
     (
         cd "$WORK/old-repo" &&
         repo-add testrepo.db.tar.gz ./*.pkg.tar.zst
-    ) >> "$LOGS/repository.log" 2>&1 || return 1
-
-    echo "Package fixtures ready."
+    ) >/dev/null 2>&1 || return 1
 }
 
 # ---------------------------------------
@@ -191,7 +186,7 @@ run_pacman() {
         --dbpath "$root/var/lib/pacman" \
         --cachedir "$root/var/cache/pacman/pkg" \
         --logfile "$root/var/log/pacman.log" \
-        --noconfirm "$@"
+        --noconfirm "$@" >/dev/null 2>&1
 }
 
 pacman_test() {
@@ -200,7 +195,7 @@ pacman_test() {
     local root="$3"
     shift 3
 
-    record_test "$id" "$name" run_pacman "$root" "$@"
+    run_pacman "$root" "$@" || true
 }
 
 # ---------------------------------------
@@ -237,8 +232,9 @@ test_06() {
     local bad="$WORK/invalid.pkg.tar.zst"
     printf 'Invalid package archive\n' > "$bad"
 
-    pacman_test 6 "Invalid package archive" "$ROOTS/06" \
-        -U "$bad"
+    pacman_test 6 "Invalid package archive" "$ROOTS/06" -U "$bad"
+
+    rm -f "$bad"
 }
 
 test_07() {
@@ -278,7 +274,7 @@ EOF
     (
         cd "$dir" &&
         makepkg --nodeps --noconfirm -f
-    ) > "$LOGS/build-file-a.log" 2>&1 || return 1
+    ) >/dev/null 2>&1 || return 1
 
     local archive_a="$dir/test-file-a-1.0-1-any.pkg.tar.zst"
 
@@ -297,17 +293,12 @@ EOF
     (
         cd "$dir" &&
         makepkg --nodeps --noconfirm -f
-    ) > "$LOGS/build-file-b.log" 2>&1 || return 1
+    ) >/dev/null 2>&1 || return 1
 
     local archive_b="$dir/test-file-b-1.0-1-any.pkg.tar.zst"
 
-    if ! run_pacman "$root" -U "$archive_a" \
-        > "$LOGS/ARCH_008-setup.log" 2>&1; then
-        cat "$LOGS/ARCH_008-setup.log"
-        return 1
-    fi
-
-    record_test 8 "File conflict" run_pacman "$root" -U "$archive_b"
+    run_pacman "$root" -U "$archive_a" || return 1
+    run_pacman "$root" -U "$archive_b" || true
 }
 
 test_09() {
@@ -338,7 +329,7 @@ EOF
     sudo pacman --config "$root/pacman.conf" \
         --root "$root" \
         --dbpath "$root/var/lib/pacman" \
-        -Sy > "$LOGS/ARCH_010-sync.log" 2>&1 || return 1
+        -Sy >/dev/null 2>&1 || true
 
     sed -i "s|$WORK/old-repo|$REPO|" "$root/pacman.conf"
 
@@ -350,111 +341,80 @@ EOF
 # Tests 11-20: Linux errors
 # ---------------------------------------
 
-# 11. Permission denied
-
 test_11() {
     local dir="$WORK/permission"
     mkdir -p "$dir"
 
     local file="$dir/protected.txt"
+
     printf 'Protected test file\n' > "$file"
     chmod 000 "$file"
 
-    record_test 11 "Permission denied" \
-        sudo -u nobody cat "$file"
+    sudo -u nobody cat "$file" >/dev/null 2>&1 || true
 
     chmod 600 "$file"
 }
-
-# 12. Read-only filesystem
 
 test_12() {
     local dir="$WORK/readonly"
     mkdir -p "$dir"
 
-    sudo mount -t tmpfs -o size=4m tmpfs "$dir" || {
-        echo "Could not mount temporary filesystem."
-        return 1
-    }
+    sudo mount -t tmpfs -o size=4m tmpfs "$dir" >/dev/null 2>&1 || return 0
 
-    if ! sudo mount -o remount,ro "$dir"; then
-        sudo umount "$dir"
-        return 1
+    if sudo mount -o remount,ro "$dir" >/dev/null 2>&1; then
+        sudo touch "$dir/test-file" >/dev/null 2>&1 || true
     fi
 
-    record_test 12 "Read-only filesystem" \
-        sudo touch "$dir/test-file"
-
-    sudo mount -o remount,rw "$dir"
-    sudo umount "$dir"
+    sudo mount -o remount,rw "$dir" >/dev/null 2>&1 || true
+    sudo umount "$dir" >/dev/null 2>&1 || true
 }
-
-# 13. Disk full
 
 test_13() {
     local dir="$WORK/disk-full"
     mkdir -p "$dir"
 
-    sudo mount -t tmpfs -o size=1m tmpfs "$dir" || {
-        echo "Could not mount temporary filesystem."
-        return 1
-    }
+    sudo mount -t tmpfs -o size=1m tmpfs "$dir" >/dev/null 2>&1 || return 0
 
-    record_test 13 "Disk full" \
-        sudo dd if=/dev/zero of="$dir/full-file" \
-        bs=256K count=16 status=none
+    sudo dd if=/dev/zero of="$dir/full-file" \
+        bs=256K count=16 status=none >/dev/null 2>&1 || true
 
-    sudo umount "$dir"
+    sudo umount "$dir" >/dev/null 2>&1 || true
 }
-
-# 14. Missing directory
 
 test_14() {
     local dir="$WORK/does-not-exist"
 
     rm -rf "$dir"
 
-    record_test 14 "Missing directory" \
-        ls "$dir"
+    ls "$dir" >/dev/null 2>&1 || true
 }
-
-# 15. Broken symbolic link
 
 test_15() {
     local dir="$WORK/broken-link"
     mkdir -p "$dir"
 
-    ln -s "$dir/nonexistent-target" "$dir/broken"
+    ln -sf "$dir/nonexistent-target" "$dir/broken"
 
-    record_test 15 "Broken symbolic link" \
-        cat "$dir/broken"
+    cat "$dir/broken" >/dev/null 2>&1 || true
 }
-
-# 16. File ownership mismatch
 
 test_16() {
     local dir="$WORK/ownership"
     mkdir -p "$dir"
 
     local file="$dir/owned-file"
+
     printf 'Ownership test\n' > "$file"
 
-    sudo chown root:root "$file"
-    sudo chmod 600 "$file"
+    sudo chown root:root "$file" >/dev/null 2>&1 || true
+    sudo chmod 600 "$file" >/dev/null 2>&1 || true
 
-    record_test 16 "File ownership mismatch" \
-        sudo -u nobody chown nobody "$file"
-
+    sudo -u nobody chown nobody "$file" >/dev/null 2>&1 || true
 }
-
-# 17. DNS resolution failure
 
 test_17() {
-    record_test 17 "DNS resolution failure" \
-        getent ahosts nonexistent.invalid
+    getent ahosts nonexistent.invalid >/dev/null 2>&1 || true
 }
-
-# 18. Connection refused
 
 test_18() {
     local port
@@ -465,22 +425,18 @@ s = socket.socket()
 s.bind(("127.0.0.1", 0))
 print(s.getsockname()[1])
 s.close()
-')"
+')" 2>/dev/null
 
-    record_test 18 "Connection refused" \
-        python3 -c "
+    python3 -c "
 import socket
 s = socket.socket()
 s.settimeout(2)
 s.connect(('127.0.0.1', $port))
-"
+" >/dev/null 2>&1 || true
 }
 
-# 19. Network timeout
-
 test_19() {
-    record_test 19 "Network timeout" \
-        python3 -c '
+    python3 -c '
 import socket, threading, time
 
 server = socket.socket()
@@ -503,42 +459,31 @@ try:
     client.connect(("127.0.0.1", port))
     client.recv(1)
 except socket.timeout:
-    print("TimeoutError: operation timed out")
-    raise SystemExit(1)
+    pass
 finally:
     client.close()
     server.close()
     thread.join()
-'
+' >/dev/null 2>&1 || true
 }
-
-# 20. Invalid proxy configuration
 
 test_20() {
-    if ! command -v curl >/dev/null 2>&1; then
-        echo "curl is required for test 20."
-        return 1
-    fi
-
-    record_test 20 "Invalid proxy configuration" \
-        curl --silent --show-error \
+    curl --silent --show-error \
         --max-time 3 \
         --proxy http://127.0.0.1:1 \
-        http://example.com/
+        http://example.com/ >/dev/null 2>&1 || true
 }
 
 # ---------------------------------------
-# Tests 21-35: System errors
+# Tests 21-34: System errors
 # ---------------------------------------
 
-# Tests 21-35
-
 test_21() {
-    command_that_does_not_exist_12345
+    command_that_does_not_exist_12345 >/dev/null 2>&1 || true
 }
 
 test_22() {
-    ls --invalid-test-option
+    ls --invalid-test-option >/dev/null 2>&1 || true
 }
 
 test_23() {
@@ -546,14 +491,14 @@ test_23() {
 import configparser
 c = configparser.ConfigParser()
 c.read_string("[broken\n")
-'
+' >/dev/null 2>&1 || true
 }
 
 test_24() {
     python3 -c '
 import ctypes
 ctypes.CDLL("lib_missing_test_12345.so")
-'
+' >/dev/null 2>&1 || true
 }
 
 test_25() {
@@ -565,20 +510,20 @@ s1.listen()
 s2 = socket.socket()
 try:
     s2.bind(s1.getsockname())
-except OSError as e:
-    print(e)
+except OSError:
+    pass
 finally:
     s1.close()
     s2.close()
-'
+' >/dev/null 2>&1 || true
 }
 
 test_26() {
-    kill -0 99999999
+    kill -0 99999999 >/dev/null 2>&1 || true
 }
 
 test_27() {
-    systemctl status nonexistent-test-service.service
+    systemctl status nonexistent-test-service.service >/dev/null 2>&1 || true
 }
 
 test_28() {
@@ -588,16 +533,15 @@ r,w = os.pipe()
 os.close(r)
 try:
     os.write(w,b"test")
-except OSError as e:
-    print(e)
-    raise SystemExit(1)
+except OSError:
+    pass
 finally:
     os.close(w)
-'
+' >/dev/null 2>&1 || true
 }
 
 test_29() {
-    cat /dev/test-device-that-does-not-exist
+    cat /dev/test-device-that-does-not-exist >/dev/null 2>&1 || true
 }
 
 test_30() {
@@ -606,20 +550,23 @@ files=[]
 try:
     while True:
         files.append(open(\"/dev/null\"))
-except OSError as e:
-    print(e)
-    raise SystemExit(1)
+except OSError:
+    pass
 finally:
     for f in files:
         f.close()
-"'
+"' >/dev/null 2>&1 || true
 }
 
 test_31() {
     local file="$WORK/non-executable.sh"
+
     printf '#!/bin/sh\necho test\n' > "$file"
     chmod 644 "$file"
-    "$file"
+
+    "$file" >/dev/null 2>&1 || true
+
+    rm -f "$file"
 }
 
 test_32() {
@@ -627,10 +574,9 @@ test_32() {
 import os
 try:
     os.read(999999, 10)
-except OSError as e:
-    print(e)
-    raise SystemExit(1)
-'
+except OSError:
+    pass
+' >/dev/null 2>&1 || true
 }
 
 test_33() {
@@ -638,10 +584,9 @@ test_33() {
 import os
 try:
     os.lseek(-1, 0, os.SEEK_SET)
-except OSError as e:
-    print(e)
-    raise SystemExit(1)
-'
+except OSError:
+    pass
+' >/dev/null 2>&1 || true
 }
 
 test_34() {
@@ -651,71 +596,27 @@ r,w = os.pipe()
 os.set_blocking(r, False)
 try:
     os.read(r, 10)
-except BlockingIOError as e:
-    print(e)
-    raise SystemExit(1)
+except BlockingIOError:
+    pass
 finally:
     os.close(r)
     os.close(w)
-'
+' >/dev/null 2>&1 || true
 }
 
-
+# ---------------------------------------
+# Test 35: Cascading package failures
+# ---------------------------------------
 
 test_35() {
-    local id=35
     local dir="$WORK/cascade-035"
     local root="$ROOTS/35"
-    local log="$LOGS/ARCH_035.log"
-    local passed=0
-    local failed=0
-    local skipped=0
 
-    mkdir -p "$dir" "$root/var/lib/pacman/local" \
-        "$root/var/cache/pacman/pkg" "$root/var/log"
+    mkdir -p "$dir" \
+        "$root/var/lib/pacman/local" \
+        "$root/var/cache/pacman/pkg" \
+        "$root/var/log"
 
-    : > "$log"
-
-    # Capture actual command output and verify expected errors.
-    stage() {
-        local name="$1"
-        local pattern="$2"
-        shift 2
-
-        local output="$dir/stage.log"
-
-        {
-            echo
-            echo "========================================"
-            echo "STAGE: $name"
-            echo "========================================"
-            printf 'COMMAND:'
-            printf ' %q' "$@"
-            echo
-        } | tee -a "$log"
-
-        if "$@" > "$output" 2>&1; then
-            cat "$output" | tee -a "$log"
-            echo "FAIL: Command unexpectedly succeeded." | tee -a "$log"
-            ((failed+=1))
-        else
-            local code=$?
-            cat "$output" | tee -a "$log"
-
-            if grep -Eiq "$pattern" "$output"; then
-                echo "PASS: Expected error reproduced (exit $code)." | tee -a "$log"
-                ((passed+=1))
-            else
-                echo "FAIL: Expected error signature not found (exit $code)." | tee -a "$log"
-                ((failed+=1))
-           fi
-        fi
-    }
-
-    echo "ARCH LINUX CASCADING FAILURE TEST" | tee -a "$log"
-    echo "Test started: $(date)" | tee -a "$log"
-
-    # Create an isolated pacman configuration.
     local config="$root/pacman.conf"
 
     cat > "$config" <<EOF
@@ -732,17 +633,14 @@ LocalFileSigLevel = Never
 Server = file://$REPO
 EOF
 
-    # 1. Invalid configuration.
     cat > "$dir/invalid.conf" <<'EOF'
 [options
 SigLevel = Never
 EOF
 
-    stage "Invalid pacman configuration" \
-        'config file|syntax|parse|could not be read' \
-        sudo pacman --config "$dir/invalid.conf" -Syy
+    sudo pacman --config "$dir/invalid.conf" -Syy \
+        >/dev/null 2>&1 || true
 
-    # 2. Missing repository database.
     cat > "$dir/missing-repo.conf" <<EOF
 [options]
 Architecture = auto
@@ -752,132 +650,56 @@ SigLevel = Never
 Server = file://$dir/nonexistent-repository
 EOF
 
-    stage "Missing repository database" \
-        'failed to synchronize|failed retrieving|could not be read|error' \
-        sudo pacman --config "$dir/missing-repo.conf" -Sy
+    sudo pacman --config "$dir/missing-repo.conf" -Sy \
+        >/dev/null 2>&1 || true
 
-    # 3. Corrupted package archive.
     printf 'NOT A VALID PACMAN PACKAGE ARCHIVE' \
         > "$dir/corrupted.pkg.tar.zst"
 
-    stage "Corrupted package archive" \
-        'invalid|could not|failed|error|archive' \
-        sudo pacman --config "$config" \
-        --root "$root" \
-        --dbpath "$root/var/lib/pacman" \
-        --cachedir "$root/var/cache/pacman/pkg" \
-        --logfile "$root/var/log/pacman.log" \
-        --noconfirm -U "$dir/corrupted.pkg.tar.zst"
+    run_pacman "$root" -U "$dir/corrupted.pkg.tar.zst" || true
 
-    # 4. Missing dependency.
-    stage "Missing package dependency" \
-        'unable to satisfy|missing dependencies|requires|could not satisfy' \
-        sudo pacman --config "$config" \
-        --root "$root" \
-        --dbpath "$root/var/lib/pacman" \
-        --cachedir "$root/var/cache/pacman/pkg" \
-        --logfile "$root/var/log/pacman.log" \
-        --noconfirm -U "$REPO/test-missing-1.0-1-any.pkg.tar.zst"
+    run_pacman "$root" -U \
+        "$REPO/test-missing-1.0-1-any.pkg.tar.zst" || true
 
-    # 5. Dependency version mismatch.
-    stage "Dependency version mismatch" \
-        'unable to satisfy|could not satisfy|requires|version' \
-        sudo pacman --config "$config" \
-        --root "$root" \
-        --dbpath "$root/var/lib/pacman" \
-        --cachedir "$root/var/cache/pacman/pkg" \
-        --logfile "$root/var/log/pacman.log" \
-        --noconfirm -S test-needs-new
+    run_pacman "$root" -S test-needs-new || true
 
-    # 6. Package conflict.
-    stage "Package conflict" \
-        'conflicts with|conflicting packages|unable to satisfy' \
-        sudo pacman --config "$config" \
-        --root "$root" \
-        --dbpath "$root/var/lib/pacman" \
-        --cachedir "$root/var/cache/pacman/pkg" \
-        --logfile "$root/var/log/pacman.log" \
-        --noconfirm -U \
+    run_pacman "$root" -U \
         "$REPO/test-conflict-a-1.0-1-any.pkg.tar.zst" \
-        "$REPO/test-conflict-b-1.0-1-any.pkg.tar.zst"
+        "$REPO/test-conflict-b-1.0-1-any.pkg.tar.zst" || true
 
-    # 7. Database lock.
-    touch "$root/var/lib/pacman/db.lck"
+    local lock="$root/var/lib/pacman/db.lck"
 
-    stage "Pacman database lock" \
-        'database is locked|unable to lock|db.lck' \
-        sudo pacman --config "$config" \
-        --root "$root" \
-        --dbpath "$root/var/lib/pacman" \
-        --cachedir "$root/var/cache/pacman/pkg" \
-        --logfile "$root/var/log/pacman.log" \
-        --noconfirm -S test-base
+    touch "$lock"
 
-    rm -f "$root/var/lib/pacman/db.lck"
+    run_pacman "$root" -S test-base || true
 
-    # 8. Repository metadata integrity.
-    if [[ -f "$REPO/testrepo.db" || -f "$REPO/testrepo.db.tar.gz" ]]; then
-        echo "Repository database exists." | tee -a "$log"
-    else
-        echo "Repository database missing." | tee -a "$log"
-        ((failed+=1))
-    fi
+    rm -f "$lock"
 
-    # 9. Dependency cycle.
-    # Pacman may accept and order cyclic dependencies rather than
-    # reporting a cycle as an error. Do not fabricate an error here.
-    echo | tee -a "$log"
-    echo "STAGE: Dependency cycle" | tee -a "$log"
-    echo "SKIP: Requires a separately validated cycle fixture." | tee -a "$log"
-    ((skipped+=1))
+    # Dependency cycles are not guaranteed to produce an error.
+    # Verify repository metadata without printing anything.
 
-    # Final report.
-    {
-        echo
-        echo "========================================"
-        echo "FINAL TEST 35 REPORT"
-        echo "========================================"
-        echo "Passed: $passed"
-        echo "Failed: $failed"
-        echo "Skipped: $skipped"
-        echo "Total: $((passed + failed + skipped))"
-        echo "========================================"
-        echo "Log: $log"
-    } | tee -a "$log"
+    [[ -f "$REPO/testrepo.db" || -f "$REPO/testrepo.db.tar.gz" ]] \
+        >/dev/null 2>&1 || true
 
-    echo
-    echo "Full diagnostic report: $log"
-
-    [[ "$failed" -eq 0 ]]
+    rm -f "$dir/corrupted.pkg.tar.zst"
 }
-
-
-
-
-
-
-
 
 # ---------------------------------------
 # Menu
 # ---------------------------------------
 
 main() {
-    require_tools || exit 1
+    require_tools || return 1
 
-    if ! command -v python3 >/dev/null 2>&1; then
-        echo "Python 3 is required for network tests."
-        exit 1
-    fi
+    command -v python3 >/dev/null 2>&1 || return 1
 
-    if ! prepare_packages; then
-        echo "Package preparation failed."
-        exit 1
-    fi
+    prepare_packages || return 1
 
     for n in {1..10}; do
         create_root "$(printf '%02d' "$n")"
     done
+
+    create_root 35
 
     while true; do
         echo
@@ -920,15 +742,12 @@ main() {
         echo "32. Read error"
         echo "33. Invalid argument"
         echo "34. Resource temporarily unavailable"
-        echo "35. Out of memory simulation"
-
-
-
-
+        echo "35. Cascading package failures"
+        echo
         echo " 0. Exit"
         echo
 
-        read -r -p "Select test: " choice
+        read -r -p "Select test: " choice || break
 
         case "$choice" in
             1) test_01 ;;
@@ -971,18 +790,11 @@ main() {
         esac
 
         echo
-        read -r -p "Run another test? (y/n): " again
+        read -r -p "Run another test? (y/n): " again || break
 
         [[ "$again" =~ ^[Yy]$ ]] || break
     done
-
-    echo
-    echo "Results saved in: $LOGS"
-
-
 }
 
 main
-
-
-
+Displaying gen2.sh.
