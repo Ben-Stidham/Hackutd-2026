@@ -6,7 +6,7 @@ type Message = {
     content: string;
 };
 
-class Nemotron {
+export class Nemotron {
     private history: Message[] = [
         {
             role: "system",
@@ -69,15 +69,3 @@ class Nemotron {
     }
 }
 
-// Example usage
-async function main() {
-    const bot = new Nemotron();
-
-    console.log("Asking Nemotron...\n");
-
-    console.log(await bot.ask("My name is Alex."));
-    console.log(await bot.ask("What is my name?"));
-    console.log(await bot.ask("Explain hash tables."));
-}
-
-main().catch(console.error);
