@@ -93,6 +93,7 @@ async function restoreSystemSnapshot(): Promise<void> {
           <div>
             <div class="section-kicker">01 / CONTEXT</div>
             <h2 id="analysis-title">System context</h2>
+            <p v-if="workflow.processName" class="context-process">{{ workflow.processName }}</p>
           </div>
           <span class="live-label">
             <span></span>
@@ -330,6 +331,13 @@ h1 span {
   margin-top: 0;
   color: #a1ada3;
   font-size: 15px;
+}
+
+.context-process {
+  margin-top: 4px;
+  color: #dcff68;
+  font: 600 12px/1.4 ui-monospace, 'SFMono-Regular', Consolas, monospace;
+  overflow-wrap: anywhere;
 }
 
 .restore-control {

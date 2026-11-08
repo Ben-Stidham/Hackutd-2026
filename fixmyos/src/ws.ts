@@ -15,6 +15,7 @@ export type ExecutedCommand = {
 export type WorkflowState = {
 	phase: WorkflowPhase
 	response: string
+	processName?: string
 	commandHistory?: ExecutedCommand[]
 	situation?: string
 	planItems?: string[]
@@ -27,6 +28,7 @@ export type WorkflowState = {
 type StateListener = (state: WorkflowState) => void
 
 type MockProcess = {
+	processName: string
 	situation: string
 	commands: string[]
 }
@@ -53,6 +55,7 @@ const MAX_FORMAT_REPHRASE_ATTEMPTS = 2
 let stateListener: StateListener | undefined
 let processIds: string[] = []
 let currentProcessIndex = 0
+let currentProcessName: string | undefined
 let currentCommand: string | undefined
 let commandHistory: ExecutedCommand[] = []
 let mockMode = false
@@ -61,6 +64,7 @@ let mockCommandIndex = 0
 
 const mockProcesses: MockProcess[] = [
 	{
+		processName: 'sync-agent',
 		situation:
 			'Lorem ipsum dolor sit amet, consectetur adipiscing elit. A background sync worker exited unexpectedly after a retry cycle. Its captured output suggests a missing executable or an incorrect service environment. I am reviewing the available process context and will propose inspection steps before any repair action.',
 		commands: [
@@ -70,6 +74,7 @@ const mockProcesses: MockProcess[] = [
 		],
 	},
 	{
+		processName: 'storage-worker',
 		situation:
 			'Curabitur sodales ligula in libero. A second sample process reported a storage-related failure. The first inspection narrowed the issue to the mount configuration; I am checking the affected path and its current mount source before suggesting a change.',
 		commands: ['findmnt -T /var/lib/example', 'df -h /var/lib/example'],
@@ -92,6 +97,7 @@ export function startRecoveryWorkflow(onState: StateListener): void {
 	stateListener = onState
 	processIds = []
 	currentProcessIndex = 0
+	currentProcessName = undefined
 	currentCommand = undefined
 	commandHistory = []
 	nemotron.reset()
@@ -212,6 +218,7 @@ async function respondToMockCommand(approved: boolean): Promise<void> {
 function showMockStep(): void {
 	const process = mockProcesses[mockProcessIndex]
 	if (!process) {
+		currentProcessName = undefined
 		updateState({
 			phase: 'complete',
 			response: 'All development scenarios have been reviewed.',
@@ -223,6 +230,7 @@ function showMockStep(): void {
 		return
 	}
 
+	currentProcessName = process.processName
 	const approvedCommands = process.commands.slice(0, mockCommandIndex)
 	const activeCommand = process.commands[mockCommandIndex]
 	const remainingCommands = process.commands.slice(mockCommandIndex)
@@ -270,6 +278,7 @@ async function findProcesses(): Promise<void> {
 async function loadCurrentProcess(): Promise<void> {
 	console.log("Loading process index:", currentProcessIndex, "of", processIds.length)
 	currentCommand = undefined
+	currentProcessName = undefined
 	if (currentProcessIndex >= processIds.length) {
 		updateState({ phase: 'complete', response: 'All selected processes have been reviewed.' })
 		return
@@ -292,6 +301,13 @@ async function loadCurrentProcess(): Promise<void> {
 			processCount: processIds.length,
 		})
 		const details = await requestSocket<unknown>('get_error', 'error_details', { id: processId })
+		currentProcessName = extractProcessName(details)
+		updateState({
+			phase: 'loading',
+			response: 'Analyzing process details...',
+			processNumber: currentProcessIndex + 1,
+			processCount: processIds.length,
+		})
 		const answer = await nemotron.ask(
 			`${agentInstructions}\n\nAdditional information for process ID ${processId}:\n` +
 				`${promptJson(details)}\n\n` +
@@ -438,7 +454,15 @@ function requestSocket<T>(event: string, responseEvent: string, payload?: unknow
 
 function updateState(state: WorkflowState): void {
 	console.log(state.phase.toUpperCase(), state.response, state.processNumber ? `(${state.processNumber}/${state.processCount})` : '')
-	stateListener?.({ ...state, commandHistory: [...commandHistory] })
+	stateListener?.({ ...state, processName: currentProcessName, commandHistory: [...commandHistory] })
+}
+
+function extractProcessName(details: unknown): string | undefined {
+	if (typeof details !== 'object' || details === null || Array.isArray(details)) return undefined
+
+	const data = details as Record<string, unknown>
+	const name = data.process_name ?? data.comm
+	return typeof name === 'string' && name.trim() ? name.trim() : undefined
 }
 
 function toExecutedCommand(command: string, result: unknown): ExecutedCommand {
