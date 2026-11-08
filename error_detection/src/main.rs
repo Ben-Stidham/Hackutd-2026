@@ -25,7 +25,7 @@ use server::HttpServerHandle;
 const DEFAULT_PID_FILE: &str = "/tmp/error_detection.pid";
 const DEFAULT_LOG_FILE: &str = "/tmp/error_detection.log";
 const DEFAULT_DB_FILE: &str = "/tmp/error_detection.db";
-const DEFAULT_PORT: u16 = 8080;
+const DEFAULT_PORT: u16 = 8032;
 
 #[derive(Debug, PartialEq, Eq)]
 enum Action {

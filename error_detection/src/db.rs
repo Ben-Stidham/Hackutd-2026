@@ -335,7 +335,7 @@ impl ErrorDatabase {
         let record = unsafe {
             sqlite3_bind_int64(stmt, 1, id);
             let res = if sqlite3_step(stmt) == SQLITE_ROW {
-                Some(read_row(st mt))
+                Some(read_row(stmt))
             } else {
                 None
             };

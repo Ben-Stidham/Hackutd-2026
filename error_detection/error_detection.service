@@ -4,7 +4,7 @@ After=network.target graphical.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/error_detection run --pid-file /run/error_detection.pid --log-file /var/log/error_detection.log --db-file /tmp/error_detection.db --port 8080
+ExecStart=/usr/local/bin/error_detection run --pid-file /run/error_detection.pid --log-file /var/log/error_detection.log --db-file /tmp/error_detection.db --port 8032
 Restart=on-failure
 RestartSec=3
 PrivateTmp=false

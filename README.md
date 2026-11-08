@@ -3,4 +3,6 @@
 ## Dependencies
 
 - `lvm2`
+- `libnotify`
+- `sqlite`
 
