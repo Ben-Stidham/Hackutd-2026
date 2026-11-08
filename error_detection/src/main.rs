@@ -1,7 +1,6 @@
 mod daemon;
 mod db;
 mod netlink;
-mod notify;
 mod output_capture;
 mod server;
 
@@ -18,7 +17,6 @@ use daemon::{
 };
 use db::ErrorDatabase;
 use netlink::{ProcEventMonitor, ProcessExitEvent};
-use notify::DesktopSession;
 use output_capture::OutputCollector;
 use server::SocketIoServerHandle;
 
@@ -34,7 +32,6 @@ enum Action {
     Stop,
     Status,
     Logs,
-    TestNotify,
     Help,
 }
 
@@ -63,10 +60,8 @@ impl Config {
             .ok()
             .and_then(|v| v.parse::<u16>().ok())
             .unwrap_or(DEFAULT_PORT);
-        let mut ignored_comms: HashSet<String> = ["notify-send", "gdbus", "journalctl"]
-            .into_iter()
-            .map(String::from)
-            .collect();
+        let mut ignored_comms: HashSet<String> =
+            ["journalctl"].into_iter().map(String::from).collect();
 
         let mut args = env::args().skip(1);
         while let Some(arg) = args.next() {
@@ -76,7 +71,6 @@ impl Config {
                 "stop" => action = Action::Stop,
                 "status" => action = Action::Status,
                 "logs" => action = Action::Logs,
-                "test-notify" => action = Action::TestNotify,
                 "-h" | "--help" | "help" => action = Action::Help,
                 "--pid-file" => {
                     let val = args
@@ -113,9 +107,7 @@ impl Config {
                     }
                 }
                 other => {
-                    return Err(format!(
-                        "Unknown argument: '{other}'. Use --help for usage."
-                    ));
+                    return Err(format!("Unknown argument: '{other}'. Use --help for usage."));
                 }
             }
         }
@@ -145,7 +137,6 @@ COMMANDS:
     stop            Stop the running background daemon
     status          Show daemon status and recent logs
     logs            Query logged errors (and stdout/stderr) from the SQLite database
-    test-notify     Send a test notification to the device notification service
     help, --help    Show this help message
 
 OPTIONS:
@@ -156,7 +147,7 @@ OPTIONS:
     --ignore <COMM,...>     Comma-separated process names to ignore
 
 SOCKET.IO EVENTS (http://127.0.0.1:{DEFAULT_PORT}):
-    get_errors / list      Returns list of all failed processes (id, process_name, error_code)
+    list_errors / list      Returns list of all failed processes (id, process_name, error_code)
     get_error / get         Given id (or ids), returns full stored details for that failed process
     run_command / run       Executes a command string and returns exit_code, stdout, and stderr
 
@@ -195,30 +186,11 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
-        Action::TestNotify => {
-            let session = DesktopSession::capture();
-            match session.send_notification(
-                "error_detection: Test Notification",
-                "Desktop notification service is connected and working.",
-            ) {
-                Ok(()) => {
-                    println!("Test notification sent successfully.");
-                    ExitCode::SUCCESS
-                }
-                Err(err) => {
-                    eprintln!("Failed to send test notification: {err}");
-                    ExitCode::FAILURE
-                }
-            }
-        }
         Action::StartDaemon => {
             if let Some(existing_pid) = read_running_pid(&config.pid_file) {
                 eprintln!("error_detection daemon is already running (PID {existing_pid}).");
                 return ExitCode::FAILURE;
             }
-
-            // Capture the user's desktop notification environment before detaching
-            let session = DesktopSession::capture();
 
             // Pre-flight check to ensure CAP_NET_ADMIN / Netlink Proc Connector access before forking
             if let Err(err) = preflight_netlink_check() {
@@ -238,17 +210,16 @@ fn main() -> ExitCode {
                 return ExitCode::FAILURE;
             }
 
-            run_monitor_loop(&config, &session, true)
+            run_monitor_loop(&config, true)
         }
         Action::RunForeground => {
-            let session = DesktopSession::capture();
             if let Err(err) = write_pid_file(&config.pid_file) {
                 eprintln!(
                     "Warning: could not write PID file {}: {err}",
                     config.pid_file.display()
                 );
             }
-            run_monitor_loop(&config, &session, false)
+            run_monitor_loop(&config, false)
         }
     }
 }
@@ -322,7 +293,7 @@ fn cmd_logs(db_path: &Path) -> ExitCode {
                      Process: '{}' (pid={}, tgid={}, ppid={}) | exit_code={} signal={:?}\n\
                      Command: {}\n\
                      Summary: {}\n\
-                     Notification:\n{}\n\
+                     Details:\n{}\n\
                      --- STDOUT ---\n{}\n\
                      --- STDERR ---\n{}",
                     rec.id,
@@ -358,7 +329,7 @@ fn cmd_logs(db_path: &Path) -> ExitCode {
     }
 }
 
-fn run_monitor_loop(config: &Config, session: &DesktopSession, is_daemon: bool) -> ExitCode {
+fn run_monitor_loop(config: &Config, is_daemon: bool) -> ExitCode {
     install_signal_handlers();
 
     let db = match ErrorDatabase::open(&config.db_file) {
@@ -407,12 +378,10 @@ fn run_monitor_loop(config: &Config, session: &DesktopSession, is_daemon: bool) 
     };
 
     log_message(&format!(
-        "error_detection started (pid={self_pid}, db={}, port={}, ebpf_capture={}, target_user={:?}, dbus={:?})",
+        "error_detection started (pid={self_pid}, db={}, port={}, ebpf_capture={})",
         config.db_file.display(),
         config.port,
-        output_collector.has_ebpf(),
-        session.target_user,
-        session.dbus_address
+        output_collector.has_ebpf()
     ));
 
     while !is_shutdown_requested() {
@@ -421,36 +390,21 @@ fn run_monitor_loop(config: &Config, session: &DesktopSession, is_daemon: bool) 
         match monitor.poll_events() {
             Ok(events) => {
                 for ev in events {
-                    if should_notify(&ev, self_pid, &config.ignored_comms) {
-                        let (summary, body) = format_exit_notification(&ev);
+                    if should_record_error(&ev, self_pid, &config.ignored_comms) {
+                        let (summary, body) = format_exit_details(&ev);
                         let (stdout, stderr) = output_collector.collect_for_exit(&ev);
 
                         log_message(&format!(
                             "ERROR: {summary} | {} | raw=0x{:x}\n  stdout: {}\n  stderr: {}",
                             body.replace('\n', ", "),
                             ev.raw_status,
-                            if stdout.is_empty() {
-                                "<empty>"
-                            } else {
-                                &stdout
-                            },
-                            if stderr.is_empty() {
-                                "<empty>"
-                            } else {
-                                &stderr
-                            }
+                            if stdout.is_empty() { "<empty>" } else { &stdout },
+                            if stderr.is_empty() { "<empty>" } else { &stderr }
                         ));
 
                         if let Err(err) = db.insert_error(&ev, &summary, &body, &stdout, &stderr) {
                             log_message(&format!(
                                 "Warning: failed to insert error into database for pid {}: {err}",
-                                ev.tgid
-                            ));
-                        }
-
-                        if let Err(err) = session.send_notification(&summary, &body) {
-                            log_message(&format!(
-                                "Warning: failed to send desktop notification for pid {}: {err}",
                                 ev.tgid
                             ));
                         }
@@ -470,11 +424,15 @@ fn run_monitor_loop(config: &Config, session: &DesktopSession, is_daemon: bool) 
     ExitCode::SUCCESS
 }
 
-fn should_notify(ev: &ProcessExitEvent, daemon_pid: i32, ignored_comms: &HashSet<String>) -> bool {
+fn should_record_error(
+    ev: &ProcessExitEvent,
+    daemon_pid: i32,
+    ignored_comms: &HashSet<String>,
+) -> bool {
     if ev.exit_code == 0 {
         return false;
     }
-    // Ignore the daemon itself or direct helper children spawned by the daemon (e.g. notify-send, journalctl)
+    // Ignore the daemon itself or direct helper children spawned by the daemon (e.g. journalctl)
     if ev.tgid == daemon_pid || ev.parent_pid == daemon_pid {
         return false;
     }
@@ -484,7 +442,7 @@ fn should_notify(ev: &ProcessExitEvent, daemon_pid: i32, ignored_comms: &HashSet
     true
 }
 
-fn format_exit_notification(ev: &ProcessExitEvent) -> (String, String) {
+fn format_exit_details(ev: &ProcessExitEvent) -> (String, String) {
     let summary = match ev.exit_signal {
         Some(sig) => format!(
             "Process '{}' (PID {}) killed by signal {}",
@@ -529,34 +487,34 @@ mod tests {
     }
 
     #[test]
-    fn test_should_notify_filters_zero_and_daemon_children() {
-        let ignored: HashSet<String> = ["notify-send"].into_iter().map(String::from).collect();
+    fn test_should_record_error_filters_zero_and_daemon_children() {
+        let ignored: HashSet<String> = ["journalctl"].into_iter().map(String::from).collect();
 
         let ok_ev = sample_event();
-        assert!(!should_notify(&ok_ev, 999, &ignored));
+        assert!(!should_record_error(&ok_ev, 999, &ignored));
 
         let err_ev = ProcessExitEvent {
             exit_code: 1,
             raw_status: 1 << 8,
             ..ok_ev.clone()
         };
-        assert!(should_notify(&err_ev, 999, &ignored));
+        assert!(should_record_error(&err_ev, 999, &ignored));
 
         let daemon_child = ProcessExitEvent {
             parent_pid: 999,
             ..err_ev.clone()
         };
-        assert!(!should_notify(&daemon_child, 999, &ignored));
+        assert!(!should_record_error(&daemon_child, 999, &ignored));
 
         let ignored_proc = ProcessExitEvent {
-            comm: "notify-send".to_string(),
+            comm: "journalctl".to_string(),
             ..err_ev
         };
-        assert!(!should_notify(&ignored_proc, 999, &ignored));
+        assert!(!should_record_error(&ignored_proc, 999, &ignored));
     }
 
     #[test]
-    fn test_format_exit_notification() {
+    fn test_format_exit_details() {
         let ev = ProcessExitEvent {
             pid: 4242,
             tgid: 4242,
@@ -570,11 +528,8 @@ mod tests {
             stderr_path: None,
             systemd_unit: None,
         };
-        let (summary, body) = format_exit_notification(&ev);
-        assert_eq!(
-            summary,
-            "Process 'backup-job' (PID 4242) exited with code 2"
-        );
+        let (summary, body) = format_exit_details(&ev);
+        assert_eq!(summary, "Process 'backup-job' (PID 4242) exited with code 2");
         assert!(body.contains("/usr/local/bin/backup-job --full"));
     }
 
@@ -600,15 +555,9 @@ mod tests {
             stderr_path: None,
             systemd_unit: None,
         };
-        let (summary, body) = format_exit_notification(&ev);
-        db.insert_error(
-            &ev,
-            &summary,
-            &body,
-            "hello stdout\nline 2",
-            "fatal stderr\nboom",
-        )
-        .expect("should insert error record");
+        let (summary, body) = format_exit_details(&ev);
+        db.insert_error(&ev, &summary, &body, "hello stdout\nline 2", "fatal stderr\nboom")
+            .expect("should insert error record");
 
         let rows = db.recent_errors(10).expect("should query recent errors");
         assert_eq!(rows.len(), 1);
