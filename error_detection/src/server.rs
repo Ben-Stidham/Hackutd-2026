@@ -1,26 +1,138 @@
-use std::io::{self, BufRead, BufReader, Write};
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream};
+use std::io;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
+
+use axum::Router;
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+use socketioxide::SocketIo;
+use socketioxide::extract::{AckSender, Data, SocketRef};
+use tower_http::cors::CorsLayer;
 
 use crate::daemon::{is_shutdown_requested, log_message};
 use crate::db::{ErrorDatabase, ErrorLogRecord};
 
-pub struct HttpServerHandle {
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ErrorSummaryItem {
+    pub id: i64,
+    pub process_name: String,
+    pub comm: String,
+    pub error_code: i32,
+    pub exit_code: i32,
+}
+
+impl From<&ErrorLogRecord> for ErrorSummaryItem {
+    fn from(r: &ErrorLogRecord) -> Self {
+        Self {
+            id: r.id,
+            process_name: r.comm.clone(),
+            comm: r.comm.clone(),
+            error_code: r.exit_code,
+            exit_code: r.exit_code,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ErrorDetailItem {
+    pub id: i64,
+    pub timestamp: i64,
+    pub boot_id: String,
+    pub pid: i32,
+    pub tgid: i32,
+    pub parent_pid: i32,
+    pub process_name: String,
+    pub comm: String,
+    pub cmdline: String,
+    pub error_code: i32,
+    pub exit_code: i32,
+    pub exit_signal: Option<i32>,
+    pub summary: String,
+    pub notification_body: String,
+    pub stdout: String,
+    pub stderr: String,
+}
+
+impl From<ErrorLogRecord> for ErrorDetailItem {
+    fn from(r: ErrorLogRecord) -> Self {
+        Self {
+            id: r.id,
+            timestamp: r.timestamp,
+            boot_id: r.boot_id,
+            pid: r.pid,
+            tgid: r.tgid,
+            parent_pid: r.parent_pid,
+            process_name: r.comm.clone(),
+            comm: r.comm,
+            cmdline: r.cmdline,
+            error_code: r.exit_code,
+            exit_code: r.exit_code,
+            exit_signal: r.exit_signal,
+            summary: r.summary,
+            notification_body: r.notification_body,
+            stdout: r.stdout,
+            stderr: r.stderr,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CommandExecutionResult {
+    pub command: String,
+    pub exit_code: i32,
+    pub error_code: i32,
+    pub stdout: String,
+    pub stderr: String,
+}
+
+pub struct SocketIoServerHandle {
     pub local_addr: SocketAddr,
     join_handle: Option<JoinHandle<()>>,
 }
 
-impl HttpServerHandle {
+impl SocketIoServerHandle {
     pub fn start(port: u16, db_path: PathBuf) -> io::Result<Self> {
         let bind_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
-        let listener = TcpListener::bind(bind_addr)?;
-        listener.set_nonblocking(true)?;
-        let local_addr = listener.local_addr()?;
+        let std_listener = std::net::TcpListener::bind(bind_addr)?;
+        std_listener.set_nonblocking(true)?;
+        let local_addr = std_listener.local_addr()?;
 
         let join_handle = thread::spawn(move || {
-            run_http_server(listener, &db_path);
+            let rt = match tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(rt) => rt,
+                Err(err) => {
+                    log_message(&format!(
+                        "Failed to build Tokio runtime for Socket.IO: {err}"
+                    ));
+                    return;
+                }
+            };
+
+            rt.block_on(async move {
+                let Ok(listener) = tokio::net::TcpListener::from_std(std_listener) else {
+                    log_message("Failed to convert std TcpListener to tokio TcpListener");
+                    return;
+                };
+
+                let app = build_socket_io_router(Arc::new(db_path));
+
+                let server = axum::serve(listener, app).with_graceful_shutdown(async {
+                    while !is_shutdown_requested() {
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                });
+
+                if let Err(err) = server.await {
+                    log_message(&format!("Socket.IO server error: {err}"));
+                }
+            });
         });
 
         Ok(Self {
@@ -30,7 +142,7 @@ impl HttpServerHandle {
     }
 }
 
-impl Drop for HttpServerHandle {
+impl Drop for SocketIoServerHandle {
     fn drop(&mut self) {
         if let Some(handle) = self.join_handle.take() {
             let _ = handle.join();
@@ -38,277 +150,234 @@ impl Drop for HttpServerHandle {
     }
 }
 
-fn run_http_server(listener: TcpListener, db_path: &Path) {
-    while !is_shutdown_requested() {
-        match listener.accept() {
-            Ok((stream, peer_addr)) => {
-                if !peer_addr.ip().is_loopback() {
-                    let _ = write_http_response(
-                        stream,
-                        403,
-                        "Forbidden",
-                        r#"{"error":"Only requests from localhost are allowed"}"#,
+pub fn build_socket_io_router(db_path: Arc<PathBuf>) -> Router {
+    let (layer, io) = SocketIo::new_layer();
+
+    io.ns("/", move |socket: SocketRef| {
+        let db_for_list = Arc::clone(&db_path);
+        let db_for_list_alias = Arc::clone(&db_path);
+        let db_for_get = Arc::clone(&db_path);
+        let db_for_get_alias = Arc::clone(&db_path);
+
+        // 1. List all failed processes (only when prompted by the client)
+        socket.on("get_errors", move |s: SocketRef, ack: AckSender| {
+            let db_path = Arc::clone(&db_for_list);
+            async move {
+                let payload = query_error_list(&db_path);
+                let _ = ack.send(&payload);
+                let _ = s.emit("errors_list", &payload);
+            }
+        });
+
+        socket.on("list", move |s: SocketRef, ack: AckSender| {
+            let db_path = Arc::clone(&db_for_list_alias);
+            async move {
+                let payload = query_error_list(&db_path);
+                let _ = ack.send(&payload);
+                let _ = s.emit("errors_list", &payload);
+            }
+        });
+
+        // 2. Get stored information for a specific failed process ID (or list of IDs)
+        socket.on(
+            "get_error",
+            move |s: SocketRef, Data::<Value>(data), ack: AckSender| {
+                let db_path = Arc::clone(&db_for_get);
+                async move {
+                    let payload = query_error_details(&db_path, &data);
+                    let _ = ack.send(&payload);
+                    let _ = s.emit("error_details", &payload);
+                }
+            },
+        );
+
+        socket.on(
+            "get",
+            move |s: SocketRef, Data::<Value>(data), ack: AckSender| {
+                let db_path = Arc::clone(&db_for_get_alias);
+                async move {
+                    let payload = query_error_details(&db_path, &data);
+                    let _ = ack.send(&payload);
+                    let _ = s.emit("error_details", &payload);
+                }
+            },
+        );
+
+        // 3. Execute a command string on the computer and return exit_code, stdout, and stderr
+        socket.on(
+            "run_command",
+            move |s: SocketRef, Data::<Value>(data), ack: AckSender| async move {
+                let payload = handle_run_command_payload(&data).await;
+                let _ = ack.send(&payload);
+                let _ = s.emit("command_result", &payload);
+            },
+        );
+
+        socket.on(
+            "run",
+            move |s: SocketRef, Data::<Value>(data), ack: AckSender| async move {
+                let payload = handle_run_command_payload(&data).await;
+                let _ = ack.send(&payload);
+                let _ = s.emit("command_result", &payload);
+            },
+        );
+    });
+
+    Router::new().layer(layer).layer(CorsLayer::permissive())
+}
+
+pub fn query_error_list(db_path: &Path) -> Value {
+    let db = match ErrorDatabase::open_query(db_path) {
+        Ok(db) => db,
+        Err(err) => return json!({ "error": format!("Database error: {err}") }),
+    };
+
+    match db.all_errors() {
+        Ok(records) => {
+            let items: Vec<ErrorSummaryItem> = records.iter().map(ErrorSummaryItem::from).collect();
+            serde_json::to_value(items).unwrap_or_else(|_| json!([]))
+        }
+        Err(err) => json!({ "error": format!("Query failed: {err}") }),
+    }
+}
+
+pub fn query_error_details(db_path: &Path, data: &Value) -> Value {
+    let db = match ErrorDatabase::open_query(db_path) {
+        Ok(db) => db,
+        Err(err) => return json!({ "error": format!("Database error: {err}") }),
+    };
+
+    if let Some(ids) = extract_ids_from_value(data) {
+        let mut results = Vec::with_capacity(ids.len());
+        for id in ids {
+            match db.get_error_by_id(id) {
+                Ok(Some(rec)) => {
+                    results.push(
+                        serde_json::to_value(ErrorDetailItem::from(rec)).unwrap_or(Value::Null),
                     );
-                    continue;
                 }
-                let _ = handle_client(stream, db_path);
-            }
-            Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
-                thread::sleep(Duration::from_millis(50));
-            }
-            Err(err) => {
-                log_message(&format!("HTTP accept error: {err}"));
-                thread::sleep(Duration::from_millis(100));
-            }
-        }
-    }
-}
-
-fn handle_client(stream: TcpStream, db_path: &Path) -> io::Result<()> {
-    let _ = stream.set_nonblocking(false);
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
-    let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
-
-    let mut reader = BufReader::new(stream.try_clone()?);
-    let mut request_line = String::new();
-    if reader.read_line(&mut request_line)? == 0 {
-        return Ok(());
-    }
-
-    // Drain remaining request headers until blank line
-    loop {
-        let mut header_line = String::new();
-        let n = reader.read_line(&mut header_line)?;
-        if n == 0 || header_line == "\r\n" || header_line == "\n" {
-            break;
-        }
-    }
-
-    let parts: Vec<&str> = request_line.split_whitespace().collect();
-    if parts.len() < 2 {
-        return write_http_response(
-            stream,
-            400,
-            "Bad Request",
-            r#"{"error":"Malformed HTTP request line"}"#,
-        );
-    }
-
-    let method = parts[0];
-    let raw_target = parts[1];
-
-    if method == "OPTIONS" {
-        return write_http_response(stream, 204, "No Content", "");
-    }
-
-    if method != "GET" {
-        return write_http_response(
-            stream,
-            405,
-            "Method Not Allowed",
-            r#"{"error":"Only GET requests are supported"}"#,
-        );
-    }
-
-    let (status_code, status_text, body) = route_get_request(raw_target, db_path);
-    write_http_response(stream, status_code, status_text, &body)
-}
-
-#[derive(Debug, PartialEq, Eq)]
-pub enum RouteMatch {
-    ListAll,
-    GetById(i64),
-    InvalidId(String),
-    NotFound,
-}
-
-pub fn parse_route(raw_target: &str) -> RouteMatch {
-    let (path, query) = match raw_target.split_once('?') {
-        Some((p, q)) => (p, Some(q)),
-        None => (raw_target, None),
-    };
-
-    let trimmed_path = path.trim_end_matches('/');
-    let normalized = if trimmed_path.is_empty() {
-        "/"
-    } else {
-        trimmed_path
-    };
-
-    // Check if ?id=<id> was provided in the query string on a valid endpoint
-    if let Some(q) = query {
-        for pair in q.split('&') {
-            if let Some(val) = pair.strip_prefix("id=") {
-                if matches!(normalized, "/" | "/errors" | "/api/errors" | "/processes") {
-                    return match val.parse::<i64>() {
-                        Ok(id) => RouteMatch::GetById(id),
-                        Err(_) => RouteMatch::InvalidId(val.to_string()),
-                    };
+                Ok(None) => {
+                    results.push(json!({
+                        "error": format!("No failed process found with id {id}"),
+                        "id": id
+                    }));
+                }
+                Err(err) => {
+                    return json!({ "error": format!("Query failed: {err}") });
                 }
             }
         }
+        return Value::Array(results);
     }
 
-    match normalized {
-        "/" | "/errors" | "/api/errors" | "/processes" => RouteMatch::ListAll,
-        _ => {
-            for prefix in ["/errors/", "/api/errors/", "/processes/"] {
-                if let Some(rest) = normalized.strip_prefix(prefix) {
-                    if !rest.contains('/') {
-                        return match rest.parse::<i64>() {
-                            Ok(id) => RouteMatch::GetById(id),
-                            Err(_) => RouteMatch::InvalidId(rest.to_string()),
-                        };
+    let Some(id) = extract_single_id_from_value(data) else {
+        return json!({ "error": "Invalid or missing process error ID" });
+    };
+
+    match db.get_error_by_id(id) {
+        Ok(Some(rec)) => serde_json::to_value(ErrorDetailItem::from(rec)).unwrap_or(Value::Null),
+        Ok(None) => json!({
+            "error": format!("No failed process found with id {id}"),
+            "id": id
+        }),
+        Err(err) => json!({ "error": format!("Query failed: {err}") }),
+    }
+}
+
+pub async fn handle_run_command_payload(data: &Value) -> Value {
+    let Some(cmd_str) = extract_command_from_value(data) else {
+        return json!({
+            "command": "",
+            "exit_code": -1,
+            "error_code": -1,
+            "stdout": "",
+            "stderr": "Missing or empty command string"
+        });
+    };
+
+    let res = tokio::task::spawn_blocking(move || execute_command(&cmd_str)).await;
+    match res {
+        Ok(exec_res) => serde_json::to_value(exec_res).unwrap_or(Value::Null),
+        Err(err) => json!({
+            "command": "",
+            "exit_code": -1,
+            "error_code": -1,
+            "stdout": "",
+            "stderr": format!("Task join error: {err}")
+        }),
+    }
+}
+
+pub fn execute_command(cmd_str: &str) -> CommandExecutionResult {
+    log_message(&format!("Executing Socket.IO command: {cmd_str}"));
+    match Command::new("sh")
+        .arg("-c")
+        .arg(cmd_str)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+    {
+        Ok(output) => {
+            let exit_code = output.status.code().unwrap_or(-1);
+            let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+            let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+            CommandExecutionResult {
+                command: cmd_str.to_string(),
+                exit_code,
+                error_code: exit_code,
+                stdout,
+                stderr,
+            }
+        }
+        Err(err) => CommandExecutionResult {
+            command: cmd_str.to_string(),
+            exit_code: -1,
+            error_code: -1,
+            stdout: String::new(),
+            stderr: format!("Failed to execute command: {err}"),
+        },
+    }
+}
+
+fn extract_single_id_from_value(val: &Value) -> Option<i64> {
+    match val {
+        Value::Number(n) => n.as_i64(),
+        Value::String(s) => s.trim().parse::<i64>().ok(),
+        Value::Object(map) => map.get("id").and_then(extract_single_id_from_value),
+        _ => None,
+    }
+}
+
+fn extract_ids_from_value(val: &Value) -> Option<Vec<i64>> {
+    match val {
+        Value::Array(arr) => {
+            let mut ids = Vec::with_capacity(arr.len());
+            for item in arr {
+                ids.push(extract_single_id_from_value(item)?);
+            }
+            Some(ids)
+        }
+        Value::Object(map) => map.get("ids").and_then(extract_ids_from_value),
+        _ => None,
+    }
+}
+
+fn extract_command_from_value(val: &Value) -> Option<String> {
+    match val {
+        Value::String(s) if !s.trim().is_empty() => Some(s.clone()),
+        Value::Object(map) => {
+            for key in ["command", "cmd", "run", "exec"] {
+                if let Some(Value::String(s)) = map.get(key) {
+                    if !s.trim().is_empty() {
+                        return Some(s.clone());
                     }
                 }
             }
-            RouteMatch::NotFound
+            None
         }
+        _ => None,
     }
-}
-
-pub fn route_get_request(raw_target: &str, db_path: &Path) -> (u16, &'static str, String) {
-    let route = parse_route(raw_target);
-    match route {
-        RouteMatch::NotFound => (
-            404,
-            "Not Found",
-            r#"{"error":"Endpoint not found. Use GET /errors or GET /errors/<id>"}"#.to_string(),
-        ),
-        RouteMatch::InvalidId(bad) => (
-            400,
-            "Bad Request",
-            format!(r#"{{"error":"Invalid error ID: {}"}}"#, json_escape(&bad)),
-        ),
-        RouteMatch::ListAll => {
-            let db = match ErrorDatabase::open_query(db_path) {
-                Ok(db) => db,
-                Err(err) => {
-                    return (
-                        500,
-                        "Internal Server Error",
-                        format!(r#"{{"error":"Database error: {}"}}"#, json_escape(&err.to_string())),
-                    );
-                }
-            };
-            match db.all_errors() {
-                Ok(records) => (200, "OK", format_error_list_json(&records)),
-                Err(err) => (
-                    500,
-                    "Internal Server Error",
-                    format!(r#"{{"error":"Query failed: {}"}}"#, json_escape(&err.to_string())),
-                ),
-            }
-        }
-        RouteMatch::GetById(id) => {
-            let db = match ErrorDatabase::open_query(db_path) {
-                Ok(db) => db,
-                Err(err) => {
-                    return (
-                        500,
-                        "Internal Server Error",
-                        format!(r#"{{"error":"Database error: {}"}}"#, json_escape(&err.to_string())),
-                    );
-                }
-            };
-            match db.get_error_by_id(id) {
-                Ok(Some(rec)) => (200, "OK", format_error_detail_json(&rec)),
-                Ok(None) => (
-                    404,
-                    "Not Found",
-                    format!(r#"{{"error":"No failed process found with id {id}"}}"#),
-                ),
-                Err(err) => (
-                    500,
-                    "Internal Server Error",
-                    format!(r#"{{"error":"Query failed: {}"}}"#, json_escape(&err.to_string())),
-                ),
-            }
-        }
-    }
-}
-
-pub fn format_error_list_json(records: &[ErrorLogRecord]) -> String {
-    let items: Vec<String> = records
-        .iter()
-        .map(|r| {
-            let comm = json_escape(&r.comm);
-            format!(
-                r#"{{"id":{},"process_name":"{}","comm":"{}","error_code":{},"exit_code":{}}}"#,
-                r.id, comm, comm, r.exit_code, r.exit_code
-            )
-        })
-        .collect();
-    format!("[{}]", items.join(","))
-}
-
-pub fn format_error_detail_json(r: &ErrorLogRecord) -> String {
-    let signal_json = match r.exit_signal {
-        Some(sig) => sig.to_string(),
-        None => "null".to_string(),
-    };
-    let comm = json_escape(&r.comm);
-    format!(
-        r#"{{"id":{},"timestamp":{},"boot_id":"{}","pid":{},"tgid":{},"parent_pid":{},"process_name":"{}","comm":"{}","cmdline":"{}","error_code":{},"exit_code":{},"exit_signal":{},"summary":"{}","notification_body":"{}","stdout":"{}","stderr":"{}"}}"#,
-        r.id,
-        r.timestamp,
-        json_escape(&r.boot_id),
-        r.pid,
-        r.tgid,
-        r.parent_pid,
-        comm,
-        comm,
-        json_escape(&r.cmdline),
-        r.exit_code,
-        r.exit_code,
-        signal_json,
-        json_escape(&r.summary),
-        json_escape(&r.notification_body),
-        json_escape(&r.stdout),
-        json_escape(&r.stderr),
-    )
-}
-
-pub fn json_escape(input: &str) -> String {
-    let mut out = String::with_capacity(input.len());
-    for c in input.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            '\u{08}' => out.push_str("\\b"),
-            '\u{0c}' => out.push_str("\\f"),
-            c if (c as u32) < 0x20 => {
-                out.push_str(&format!("\\u{:04x}", c as u32));
-            }
-            c => out.push(c),
-        }
-    }
-    out
-}
-
-fn write_http_response(
-    mut stream: TcpStream,
-    status_code: u16,
-    status_text: &str,
-    body: &str,
-) -> io::Result<()> {
-    let response = format!(
-        "HTTP/1.1 {status_code} {status_text}\r\n\
-         Content-Type: application/json; charset=utf-8\r\n\
-         Content-Length: {}\r\n\
-         Access-Control-Allow-Origin: *\r\n\
-         Access-Control-Allow-Methods: GET, OPTIONS\r\n\
-         Access-Control-Allow-Headers: Content-Type\r\n\
-         Connection: close\r\n\
-         \r\n\
-         {body}",
-        body.len()
-    );
-    stream.write_all(response.as_bytes())?;
-    stream.flush()
 }
 
 #[cfg(test)]
@@ -318,25 +387,9 @@ mod tests {
     use std::fs;
 
     #[test]
-    fn test_parse_routes() {
-        assert_eq!(parse_route("/errors"), RouteMatch::ListAll);
-        assert_eq!(parse_route("/errors/"), RouteMatch::ListAll);
-        assert_eq!(parse_route("/api/errors"), RouteMatch::ListAll);
-        assert_eq!(parse_route("/processes"), RouteMatch::ListAll);
-        assert_eq!(parse_route("/errors/42"), RouteMatch::GetById(42));
-        assert_eq!(parse_route("/errors?id=42"), RouteMatch::GetById(42));
-        assert_eq!(parse_route("/api/errors/7"), RouteMatch::GetById(7));
-        assert_eq!(
-            parse_route("/errors/notanumber"),
-            RouteMatch::InvalidId("notanumber".to_string())
-        );
-        assert_eq!(parse_route("/unknown/path"), RouteMatch::NotFound);
-    }
-
-    #[test]
-    fn test_route_get_list_and_detail() {
+    fn test_socketio_handlers_list_and_detail() {
         let db_path = PathBuf::from(format!(
-            "/tmp/test_http_error_detection_{}.db",
+            "/tmp/test_socketio_error_detection_{}.db",
             std::process::id()
         ));
         let _ = fs::remove_file(&db_path);
@@ -364,25 +417,40 @@ mod tests {
         )
         .expect("insert error");
 
-        let (code, _, list_json) = route_get_request("/errors", &db_path);
-        assert_eq!(code, 200);
-        assert!(list_json.contains(r#""id":1"#));
-        assert!(list_json.contains(r#""process_name":"broken_worker""#));
-        assert!(list_json.contains(r#""error_code":127"#));
+        let list_val = query_error_list(&db_path);
+        let arr = list_val.as_array().expect("should return JSON array");
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["id"], 1);
+        assert_eq!(arr[0]["process_name"], "broken_worker");
+        assert_eq!(arr[0]["error_code"], 127);
 
-        let (code, _, detail_json) = route_get_request("/errors/1", &db_path);
-        assert_eq!(code, 200);
-        assert!(detail_json.contains(r#""id":1"#));
-        assert!(detail_json.contains(r#""cmdline":"broken_worker --retry""#));
-        assert!(detail_json.contains(r#""stdout":"starting worker...\n""#));
-        assert!(detail_json.contains(r#""stderr":"command not found\n""#));
+        let detail_val = query_error_details(&db_path, &json!(1));
+        assert_eq!(detail_val["id"], 1);
+        assert_eq!(detail_val["cmdline"], "broken_worker --retry");
+        assert_eq!(detail_val["stdout"], "starting worker...\n");
+        assert_eq!(detail_val["stderr"], "command not found\n");
 
-        let (code404, _, _) = route_get_request("/errors/999", &db_path);
-        assert_eq!(code404, 404);
+        let detail_obj_val = query_error_details(&db_path, &json!({ "id": 1 }));
+        assert_eq!(detail_obj_val["id"], 1);
+
+        let batch_val = query_error_details(&db_path, &json!([1, 999]));
+        let batch_arr = batch_val.as_array().expect("batch array");
+        assert_eq!(batch_arr.len(), 2);
+        assert_eq!(batch_arr[0]["id"], 1);
+        assert!(batch_arr[1]["error"].is_string());
 
         drop(db);
         let _ = fs::remove_file(&db_path);
         let _ = fs::remove_file(format!("{}-wal", db_path.display()));
         let _ = fs::remove_file(format!("{}-shm", db_path.display()));
+    }
+
+    #[test]
+    fn test_execute_command() {
+        let res = execute_command("printf 'out_msg'; printf 'err_msg' >&2; exit 3");
+        assert_eq!(res.exit_code, 3);
+        assert_eq!(res.error_code, 3);
+        assert_eq!(res.stdout, "out_msg");
+        assert_eq!(res.stderr, "err_msg");
     }
 }

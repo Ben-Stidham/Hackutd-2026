@@ -20,7 +20,7 @@ use db::ErrorDatabase;
 use netlink::{ProcEventMonitor, ProcessExitEvent};
 use notify::DesktopSession;
 use output_capture::OutputCollector;
-use server::HttpServerHandle;
+use server::SocketIoServerHandle;
 
 const DEFAULT_PID_FILE: &str = "/tmp/error_detection.pid";
 const DEFAULT_LOG_FILE: &str = "/tmp/error_detection.log";
@@ -113,7 +113,9 @@ impl Config {
                     }
                 }
                 other => {
-                    return Err(format!("Unknown argument: '{other}'. Use --help for usage."));
+                    return Err(format!(
+                        "Unknown argument: '{other}'. Use --help for usage."
+                    ));
                 }
             }
         }
@@ -150,12 +152,13 @@ OPTIONS:
     --pid-file <PATH>       Path to PID file (default: {DEFAULT_PID_FILE})
     --log-file <PATH>       Path to log file (default: {DEFAULT_LOG_FILE})
     --db-file <PATH>        Path to SQLite database (default: {DEFAULT_DB_FILE})
-    --port <PORT>           Localhost HTTP server port (default: {DEFAULT_PORT})
+    --port <PORT>           Localhost Socket.IO server port (default: {DEFAULT_PORT})
     --ignore <COMM,...>     Comma-separated process names to ignore
 
-HTTP API (localhost only):
-    GET http://127.0.0.1:{DEFAULT_PORT}/errors       List all failed processes (id, process_name, error_code)
-    GET http://127.0.0.1:{DEFAULT_PORT}/errors/<id>  Get full stored details for a specific failed process ID
+SOCKET.IO EVENTS (http://127.0.0.1:{DEFAULT_PORT}):
+    get_errors / list      Returns list of all failed processes (id, process_name, error_code)
+    get_error / get         Given id (or ids), returns full stored details for that failed process
+    run_command / run       Executes a command string and returns exit_code, stdout, and stderr
 
 PERMISSIONS:
     Monitoring all system-wide process exits via the Linux Netlink Proc Connector
@@ -305,7 +308,10 @@ fn cmd_logs(db_path: &Path) -> ExitCode {
 
     match db.recent_errors(50) {
         Ok(records) if records.is_empty() => {
-            println!("No process errors recorded since last power on in {}.", db_path.display());
+            println!(
+                "No process errors recorded since last power on in {}.",
+                db_path.display()
+            );
             ExitCode::SUCCESS
         }
         Ok(records) => {
@@ -331,8 +337,16 @@ fn cmd_logs(db_path: &Path) -> ExitCode {
                     rec.cmdline,
                     rec.summary,
                     rec.notification_body,
-                    if rec.stdout.is_empty() { "<empty>" } else { &rec.stdout },
-                    if rec.stderr.is_empty() { "<empty>" } else { &rec.stderr },
+                    if rec.stdout.is_empty() {
+                        "<empty>"
+                    } else {
+                        &rec.stdout
+                    },
+                    if rec.stderr.is_empty() {
+                        "<empty>"
+                    } else {
+                        &rec.stderr
+                    },
                 );
             }
             ExitCode::SUCCESS
@@ -375,17 +389,17 @@ fn run_monitor_loop(config: &Config, session: &DesktopSession, is_daemon: bool) 
     let self_pid = std::process::id() as i32;
     let mut output_collector = OutputCollector::new(self_pid as u32);
 
-    let _http_server = match HttpServerHandle::start(config.port, config.db_file.clone()) {
+    let _socketio_server = match SocketIoServerHandle::start(config.port, config.db_file.clone()) {
         Ok(srv) => {
             log_message(&format!(
-                "HTTP API server listening on http://{} (localhost only)",
+                "Socket.IO server listening on http://{} (localhost only)",
                 srv.local_addr
             ));
             Some(srv)
         }
         Err(err) => {
             log_message(&format!(
-                "Warning: failed to bind HTTP server on 127.0.0.1:{}: {err}",
+                "Warning: failed to bind Socket.IO server on 127.0.0.1:{}: {err}",
                 config.port
             ));
             None
@@ -415,8 +429,16 @@ fn run_monitor_loop(config: &Config, session: &DesktopSession, is_daemon: bool) 
                             "ERROR: {summary} | {} | raw=0x{:x}\n  stdout: {}\n  stderr: {}",
                             body.replace('\n', ", "),
                             ev.raw_status,
-                            if stdout.is_empty() { "<empty>" } else { &stdout },
-                            if stderr.is_empty() { "<empty>" } else { &stderr }
+                            if stdout.is_empty() {
+                                "<empty>"
+                            } else {
+                                &stdout
+                            },
+                            if stderr.is_empty() {
+                                "<empty>"
+                            } else {
+                                &stderr
+                            }
                         ));
 
                         if let Err(err) = db.insert_error(&ev, &summary, &body, &stdout, &stderr) {
@@ -549,13 +571,19 @@ mod tests {
             systemd_unit: None,
         };
         let (summary, body) = format_exit_notification(&ev);
-        assert_eq!(summary, "Process 'backup-job' (PID 4242) exited with code 2");
+        assert_eq!(
+            summary,
+            "Process 'backup-job' (PID 4242) exited with code 2"
+        );
         assert!(body.contains("/usr/local/bin/backup-job --full"));
     }
 
     #[test]
     fn test_sqlite_database_insert_and_query() {
-        let db_path = PathBuf::from(format!("/tmp/test_error_detection_{}.db", std::process::id()));
+        let db_path = PathBuf::from(format!(
+            "/tmp/test_error_detection_{}.db",
+            std::process::id()
+        ));
         let _ = fs::remove_file(&db_path);
 
         let db = ErrorDatabase::open(&db_path).expect("should open sqlite db");
@@ -573,8 +601,14 @@ mod tests {
             systemd_unit: None,
         };
         let (summary, body) = format_exit_notification(&ev);
-        db.insert_error(&ev, &summary, &body, "hello stdout\nline 2", "fatal stderr\nboom")
-            .expect("should insert error record");
+        db.insert_error(
+            &ev,
+            &summary,
+            &body,
+            "hello stdout\nline 2",
+            "fatal stderr\nboom",
+        )
+        .expect("should insert error record");
 
         let rows = db.recent_errors(10).expect("should query recent errors");
         assert_eq!(rows.len(), 1);
