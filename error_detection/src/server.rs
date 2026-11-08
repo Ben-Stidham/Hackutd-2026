@@ -7,7 +7,7 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use axum::Router;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use serde_json::{Value, json};
 use socketioxide::SocketIo;
 use socketioxide::extract::{AckSender, Data, SocketRef, TryData};
@@ -17,7 +17,7 @@ use crate::backup::BackupManager;
 use crate::daemon::{is_shutdown_requested, log_message};
 use crate::db::{ErrorDatabase, ErrorLogRecord};
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize)]
 pub struct ErrorSummaryItem {
     pub id: i64,
     pub process_name: String,
@@ -38,7 +38,7 @@ impl From<&ErrorLogRecord> for ErrorSummaryItem {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize)]
 pub struct ErrorDetailItem {
     pub id: i64,
     pub timestamp: i64,
@@ -81,7 +81,7 @@ impl From<ErrorLogRecord> for ErrorDetailItem {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize)]
 pub struct CommandExecutionResult {
     pub command: String,
     pub exit_code: i32,
@@ -153,147 +153,89 @@ impl Drop for SocketIoServerHandle {
     }
 }
 
-pub fn build_socket_io_router(
+fn build_socket_io_router(
     db_path: Arc<PathBuf>,
     backup_manager: Arc<BackupManager>,
 ) -> Router {
     let (layer, io) = SocketIo::new_layer();
 
     io.ns("/", move |socket: SocketRef| {
-        let db_for_list = Arc::clone(&db_path);
-        let db_for_list_alias = Arc::clone(&db_path);
-        let db_for_get_errors = Arc::clone(&db_path);
-        let db_for_get = Arc::clone(&db_path);
-        let db_for_get_alias = Arc::clone(&db_path);
-
-        let bm_for_create = Arc::clone(&backup_manager);
-        let bm_for_create_alias = Arc::clone(&backup_manager);
-        let bm_for_restore = Arc::clone(&backup_manager);
-        let bm_for_restore_alias = Arc::clone(&backup_manager);
-
         // 1. List all failed processes (only when prompted by the client)
-        socket.on("list_errors", move |s: SocketRef, ack: AckSender| {
-            let db_path = Arc::clone(&db_for_list);
-            async move {
-                let payload = query_error_list(&db_path);
-                let _ = ack.send(&payload);
-                let _ = s.emit("errors_list", &payload);
-            }
-        });
-
-        socket.on("get_errors", move |s: SocketRef, ack: AckSender| {
-            let db_path = Arc::clone(&db_for_get_errors);
-            async move {
-                let payload = query_error_list(&db_path);
-                let _ = ack.send(&payload);
-                let _ = s.emit("errors_list", &payload);
-            }
-        });
-
-        socket.on("list", move |s: SocketRef, ack: AckSender| {
-            let db_path = Arc::clone(&db_for_list_alias);
-            async move {
-                let payload = query_error_list(&db_path);
-                let _ = ack.send(&payload);
-                let _ = s.emit("errors_list", &payload);
-            }
-        });
+        for event in ["list_errors", "get_errors", "list"] {
+            let db_path = Arc::clone(&db_path);
+            socket.on(event, move |s: SocketRef, ack: AckSender| {
+                let db_path = Arc::clone(&db_path);
+                async move {
+                    let payload = query_error_list(&db_path);
+                    let _ = ack.send(&payload);
+                    let _ = s.emit("errors_list", &payload);
+                }
+            });
+        }
 
         // 2. Get stored information for a specific failed process ID (or list of IDs)
-        socket.on(
-            "get_error",
-            move |s: SocketRef, Data::<Value>(data), ack: AckSender| {
-                let db_path = Arc::clone(&db_for_get);
-                async move {
-                    let payload = query_error_details(&db_path, &data);
-                    let _ = ack.send(&payload);
-                    let _ = s.emit("error_details", &payload);
-                }
-            },
-        );
-
-        socket.on(
-            "get",
-            move |s: SocketRef, Data::<Value>(data), ack: AckSender| {
-                let db_path = Arc::clone(&db_for_get_alias);
-                async move {
-                    let payload = query_error_details(&db_path, &data);
-                    let _ = ack.send(&payload);
-                    let _ = s.emit("error_details", &payload);
-                }
-            },
-        );
+        for event in ["get_error", "get"] {
+            let db_path = Arc::clone(&db_path);
+            socket.on(
+                event,
+                move |s: SocketRef, Data::<Value>(data), ack: AckSender| {
+                    let db_path = Arc::clone(&db_path);
+                    async move {
+                        let payload = query_error_details(&db_path, &data);
+                        let _ = ack.send(&payload);
+                        let _ = s.emit("error_details", &payload);
+                    }
+                },
+            );
+        }
 
         // 3. Execute a command string on the computer and return exit_code, stdout, and stderr
-        socket.on(
-            "run_command",
-            move |s: SocketRef, Data::<Value>(data), ack: AckSender| async move {
-                let payload = handle_run_command_payload(&data).await;
-                let _ = ack.send(&payload);
-                let _ = s.emit("command_result", &payload);
-            },
-        );
-
-        socket.on(
-            "run",
-            move |s: SocketRef, Data::<Value>(data), ack: AckSender| async move {
-                let payload = handle_run_command_payload(&data).await;
-                let _ = ack.send(&payload);
-                let _ = s.emit("command_result", &payload);
-            },
-        );
-
-        // 4. Create an LVM snapshot backup (overwriting the previous server-triggered backup)
-        socket.on("create_backup", move |s: SocketRef, ack: AckSender| {
-            let bm = Arc::clone(&bm_for_create);
-            async move {
-                let payload = handle_create_backup(bm).await;
-                let _ = ack.send(&payload);
-                let _ = s.emit("backup_result", &payload);
-            }
-        });
-
-        socket.on("backup", move |s: SocketRef, ack: AckSender| {
-            let bm = Arc::clone(&bm_for_create_alias);
-            async move {
-                let payload = handle_create_backup(bm).await;
-                let _ = ack.send(&payload);
-                let _ = s.emit("backup_result", &payload);
-            }
-        });
-
-        // 5. Restore an LVM snapshot backup (defaults to most recent unless specified)
-        socket.on(
-            "restore_backup",
-            move |s: SocketRef, TryData::<Value>(maybe_data), ack: AckSender| {
-                let bm = Arc::clone(&bm_for_restore);
-                async move {
-                    let target = maybe_data.ok().and_then(|v| extract_restore_target(&v));
-                    let payload = handle_restore_backup(bm, target).await;
+        for event in ["run_command", "run"] {
+            socket.on(
+                event,
+                |s: SocketRef, Data::<Value>(data), ack: AckSender| async move {
+                    let payload = handle_run_command_payload(&data).await;
                     let _ = ack.send(&payload);
-                    let _ = s.emit("restore_result", &payload);
-                }
-            },
-        );
+                    let _ = s.emit("command_result", &payload);
+                },
+            );
+        }
 
-        socket.on(
-            "restore",
-            move |s: SocketRef, TryData::<Value>(maybe_data), ack: AckSender| {
-                let bm = Arc::clone(&bm_for_restore_alias);
+        // 4. Create an rsync backup (overwriting the previous server-triggered backup)
+        for event in ["create_backup", "backup"] {
+            let bm = Arc::clone(&backup_manager);
+            socket.on(event, move |s: SocketRef, ack: AckSender| {
+                let bm = Arc::clone(&bm);
                 async move {
-                    let target = maybe_data.ok().and_then(|v| extract_restore_target(&v));
-                    let payload = handle_restore_backup(bm, target).await;
+                    let payload = handle_create_backup(bm).await;
                     let _ = ack.send(&payload);
-                    let _ = s.emit("restore_result", &payload);
+                    let _ = s.emit("backup_result", &payload);
                 }
-            },
-        );
+            });
+        }
+
+        // 5. Restore an rsync backup (defaults to most recent unless specified)
+        for event in ["restore_backup", "restore"] {
+            let bm = Arc::clone(&backup_manager);
+            socket.on(
+                event,
+                move |s: SocketRef, TryData::<Value>(maybe_data), ack: AckSender| {
+                    let bm = Arc::clone(&bm);
+                    async move {
+                        let target = maybe_data.ok().and_then(|v| extract_restore_target(&v));
+                        let payload = handle_restore_backup(bm, target).await;
+                        let _ = ack.send(&payload);
+                        let _ = s.emit("restore_result", &payload);
+                    }
+                },
+            );
+        }
     });
 
     Router::new().layer(layer).layer(CorsLayer::permissive())
 }
 
-pub async fn handle_create_backup(bm: Arc<BackupManager>) -> Value {
+async fn handle_create_backup(bm: Arc<BackupManager>) -> Value {
     match tokio::task::spawn_blocking(move || bm.create_manual_backup()).await {
         Ok(res) => serde_json::to_value(res).unwrap_or(Value::Null),
         Err(err) => json!({
@@ -304,7 +246,7 @@ pub async fn handle_create_backup(bm: Arc<BackupManager>) -> Value {
     }
 }
 
-pub async fn handle_restore_backup(bm: Arc<BackupManager>, target: Option<String>) -> Value {
+async fn handle_restore_backup(bm: Arc<BackupManager>, target: Option<String>) -> Value {
     match tokio::task::spawn_blocking(move || bm.restore_backup(target.as_deref())).await {
         Ok(res) => serde_json::to_value(res).unwrap_or(Value::Null),
         Err(err) => json!({
@@ -315,16 +257,15 @@ pub async fn handle_restore_backup(bm: Arc<BackupManager>, target: Option<String
     }
 }
 
-pub fn extract_restore_target(val: &Value) -> Option<String> {
+fn extract_restore_target(val: &Value) -> Option<String> {
     match val {
         Value::String(s) if !s.trim().is_empty() => Some(s.trim().to_string()),
         Value::Object(map) => {
             for key in ["target", "slot", "backup", "type", "name"] {
-                if let Some(Value::String(s)) = map.get(key) {
-                    if !s.trim().is_empty() {
+                if let Some(Value::String(s)) = map.get(key)
+                    && !s.trim().is_empty() {
                         return Some(s.trim().to_string());
                     }
-                }
             }
             None
         }
@@ -332,7 +273,7 @@ pub fn extract_restore_target(val: &Value) -> Option<String> {
     }
 }
 
-pub fn query_error_list(db_path: &Path) -> Value {
+fn query_error_list(db_path: &Path) -> Value {
     let db = match ErrorDatabase::open_query(db_path) {
         Ok(db) => db,
         Err(err) => return json!({ "error": format!("Database error: {err}") }),
@@ -347,7 +288,7 @@ pub fn query_error_list(db_path: &Path) -> Value {
     }
 }
 
-pub fn query_error_details(db_path: &Path, data: &Value) -> Value {
+fn query_error_details(db_path: &Path, data: &Value) -> Value {
     let db = match ErrorDatabase::open_query(db_path) {
         Ok(db) => db,
         Err(err) => return json!({ "error": format!("Database error: {err}") }),
@@ -390,7 +331,7 @@ pub fn query_error_details(db_path: &Path, data: &Value) -> Value {
     }
 }
 
-pub async fn handle_run_command_payload(data: &Value) -> Value {
+async fn handle_run_command_payload(data: &Value) -> Value {
     let Some(cmd_str) = extract_command_from_value(data) else {
         return json!({
             "command": "",
@@ -414,7 +355,7 @@ pub async fn handle_run_command_payload(data: &Value) -> Value {
     }
 }
 
-pub fn execute_command(cmd_str: &str) -> CommandExecutionResult {
+fn execute_command(cmd_str: &str) -> CommandExecutionResult {
     log_message(&format!("Executing Socket.IO command: {cmd_str}"));
     match Command::new("sh")
         .arg("-c")
@@ -474,11 +415,10 @@ fn extract_command_from_value(val: &Value) -> Option<String> {
         Value::String(s) if !s.trim().is_empty() => Some(s.clone()),
         Value::Object(map) => {
             for key in ["command", "cmd", "run", "exec"] {
-                if let Some(Value::String(s)) = map.get(key) {
-                    if !s.trim().is_empty() {
+                if let Some(Value::String(s)) = map.get(key)
+                    && !s.trim().is_empty() {
                         return Some(s.clone());
                     }
-                }
             }
             None
         }

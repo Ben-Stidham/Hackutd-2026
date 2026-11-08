@@ -133,7 +133,7 @@ pub fn read_running_pid(pid_path: &Path) -> Option<i32> {
     }
 }
 
-pub fn is_process_alive(pid: i32) -> bool {
+fn is_process_alive(pid: i32) -> bool {
     let res = unsafe { kill(pid, 0) };
     if res == 0 {
         return true;

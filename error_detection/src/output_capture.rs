@@ -155,20 +155,16 @@ impl OutputCollector {
         }
 
         // 2. Check file-backed stdout / stderr paths discovered in /proc/<pid>/fd/{1,2}
-        if let Some(ref out_path) = ev.stdout_path {
-            if let Some(content) = read_regular_file_tail(out_path) {
-                if !content.is_empty() && !stdout_parts.iter().any(|p| p == &content) {
+        if let Some(ref out_path) = ev.stdout_path
+            && let Some(content) = read_regular_file_tail(out_path)
+                && !content.is_empty() && !stdout_parts.iter().any(|p| p == &content) {
                     stdout_parts.push(content);
                 }
-            }
-        }
-        if let Some(ref err_path) = ev.stderr_path {
-            if let Some(content) = read_regular_file_tail(err_path) {
-                if !content.is_empty() && !stderr_parts.iter().any(|p| p == &content) {
+        if let Some(ref err_path) = ev.stderr_path
+            && let Some(content) = read_regular_file_tail(err_path)
+                && !content.is_empty() && !stderr_parts.iter().any(|p| p == &content) {
                     stderr_parts.push(content);
                 }
-            }
-        }
 
         // 3. Check real-time eBPF write(1) / write(2) buffers
         if let Some(captured) = self.streams.remove(&ev.tgid) {
@@ -488,17 +484,15 @@ fn query_journalctl_since_boot(pid: i32, systemd_unit: Option<&str>) -> (String,
 
     // If no entries were logged directly under _PID (e.g. short-lived worker in a service unit)
     // and we have a specific service unit, query the service unit's logs since boot
-    if stdout_lines.is_empty() && stderr_lines.is_empty() {
-        if let Some(unit) = systemd_unit {
-            if is_specific_service_unit(unit) {
+    if stdout_lines.is_empty() && stderr_lines.is_empty()
+        && let Some(unit) = systemd_unit
+            && is_specific_service_unit(unit) {
                 collect_journal_json_lines(
                     &["--boot=0", "--no-pager", "--output=json", "-u", unit],
                     &mut stdout_lines,
                     &mut stderr_lines,
                 );
             }
-        }
-    }
 
     (stdout_lines.join("\n"), stderr_lines.join("\n"))
 }
@@ -550,7 +544,7 @@ fn collect_journal_json_lines(
 }
 
 /// Lightweight extractor for string fields in single-line `journalctl -o json` records.
-pub fn extract_json_string_field(json_line: &str, key: &str) -> Option<String> {
+fn extract_json_string_field(json_line: &str, key: &str) -> Option<String> {
     let pattern = format!("\"{key}\":\"");
     let start = json_line.find(&pattern)? + pattern.len();
     let rest = &json_line[start..];

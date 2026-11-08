@@ -255,7 +255,7 @@ impl ErrorDatabase {
     pub fn recent_errors(&self, limit: i32) -> io::Result<Vec<ErrorLogRecord>> {
         let sql = CString::new(
             "SELECT id, timestamp, boot_id, pid, tgid, parent_pid, comm, cmdline, exit_code, exit_signal, summary, notification_body, stdout, stderr \
-             FROM process_errors ORDER BY id DESC LIMIT ?1;",
+             FROM process_errors ORDER BY timestamp DESC, id DESC LIMIT ?1;",
         )
         .unwrap();
 
@@ -414,7 +414,7 @@ unsafe fn sqlite_error_string(db: *mut Sqlite3) -> String {
     }
 }
 
-pub fn clear_database_files(db_path: &Path) {
+fn clear_database_files(db_path: &Path) {
     let _ = fs::remove_file(db_path);
     let base = db_path.display();
     for suffix in ["-wal", "-shm", "-journal"] {
@@ -422,7 +422,7 @@ pub fn clear_database_files(db_path: &Path) {
     }
 }
 
-pub fn current_boot_id() -> String {
+fn current_boot_id() -> String {
     fs::read_to_string("/proc/sys/kernel/random/boot_id")
         .map(|s| s.trim().to_string())
         .unwrap_or_else(|_| "unknown-boot".to_string())

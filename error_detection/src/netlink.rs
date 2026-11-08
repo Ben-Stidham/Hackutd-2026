@@ -212,11 +212,10 @@ impl ProcEventMonitor {
             let Some(name_str) = name.to_str() else {
                 continue;
             };
-            if let Ok(pid) = name_str.parse::<i32>() {
-                if let Some(meta) = read_proc_metadata(pid) {
+            if let Ok(pid) = name_str.parse::<i32>()
+                && let Some(meta) = read_proc_metadata(pid) {
                     self.cache.insert(pid, meta);
                 }
-            }
         }
     }
 
@@ -293,13 +292,11 @@ impl ProcEventMonitor {
                     && val == CN_VAL_PROC
                     && ev_offset + cn_len <= offset + nlmsg_len
                     && cn_len >= 16
-                {
-                    if let Some(exit_ev) =
+                    && let Some(exit_ev) =
                         self.handle_proc_event(&buf[ev_offset..ev_offset + cn_len])
                     {
                         exits.push(exit_ev);
                     }
-                }
             }
 
             offset += nlmsg_align(nlmsg_len);
@@ -342,8 +339,14 @@ impl ProcEventMonitor {
                 None
             }
             PROC_EVENT_COMM if payload.len() >= 24 => {
+                let process_pid =
+                    i32::from_ne_bytes([payload[0], payload[1], payload[2], payload[3]]);
                 let process_tgid =
                     i32::from_ne_bytes([payload[4], payload[5], payload[6], payload[7]]);
+                // Ignore thread renames (e.g. worker threads) so they don't overwrite the process name
+                if process_pid != process_tgid {
+                    return None;
+                }
                 let comm_bytes = &payload[8..24];
                 let nul_pos = comm_bytes
                     .iter()
@@ -358,14 +361,13 @@ impl ProcEventMonitor {
                         ..Default::default()
                     });
                 entry.comm = comm;
-                if entry.cmdline.is_empty() {
-                    if let Some(fresh) = read_proc_metadata(process_tgid) {
+                if entry.cmdline.is_empty()
+                    && let Some(fresh) = read_proc_metadata(process_tgid) {
                         entry.cmdline = fresh.cmdline;
                         entry.stdout_path = fresh.stdout_path;
                         entry.stderr_path = fresh.stderr_path;
                         entry.systemd_unit = fresh.systemd_unit;
                     }
-                }
                 None
             }
             PROC_EVENT_EXIT if payload.len() >= 16 => {
@@ -438,7 +440,7 @@ fn nlmsg_align(len: usize) -> usize {
     (len + 3) & !3
 }
 
-pub fn read_proc_metadata(pid: i32) -> Option<ProcessMetadata> {
+fn read_proc_metadata(pid: i32) -> Option<ProcessMetadata> {
     let comm_path = format!("/proc/{pid}/comm");
     let comm = fs::read_to_string(comm_path).ok()?.trim().to_string();
     if comm.is_empty() {
@@ -489,13 +491,11 @@ fn read_regular_fd_target(pid: i32, fd: i32) -> Option<String> {
 fn read_systemd_unit(pid: i32) -> Option<String> {
     let cgroup = fs::read_to_string(format!("/proc/{pid}/cgroup")).ok()?;
     for line in cgroup.lines() {
-        if let Some(path) = line.split(':').nth(2) {
-            if let Some(unit) = path.rsplit('/').next() {
-                if !unit.is_empty() && (unit.ends_with(".service") || unit.ends_with(".scope")) {
+        if let Some(path) = line.split(':').nth(2)
+            && let Some(unit) = path.rsplit('/').next()
+                && !unit.is_empty() && (unit.ends_with(".service") || unit.ends_with(".scope")) {
                     return Some(unit.to_string());
                 }
-            }
-        }
     }
     None
 }
@@ -519,6 +519,18 @@ mod tests {
         comm_data[24..35].copy_from_slice(b"failing_app");
 
         assert!(monitor.handle_proc_event(&comm_data).is_none());
+        assert_eq!(
+            monitor.cache.get(&5555).map(|m| m.comm.as_str()),
+            Some("failing_app")
+        );
+
+        // A PROC_EVENT_COMM for a non-leader thread (pid != tgid) must not rename the process
+        let mut thread_comm = vec![0u8; 40];
+        thread_comm[0..4].copy_from_slice(&PROC_EVENT_COMM.to_ne_bytes());
+        thread_comm[16..20].copy_from_slice(&5556i32.to_ne_bytes()); // thread pid
+        thread_comm[20..24].copy_from_slice(&5555i32.to_ne_bytes()); // process_tgid
+        thread_comm[24..35].copy_from_slice(b"worker-thrd");
+        assert!(monitor.handle_proc_event(&thread_comm).is_none());
         assert_eq!(
             monitor.cache.get(&5555).map(|m| m.comm.as_str()),
             Some("failing_app")

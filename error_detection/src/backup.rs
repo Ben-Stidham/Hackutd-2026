@@ -1,11 +1,10 @@
-use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 
 use crate::daemon::log_message;
 
@@ -14,8 +13,7 @@ pub const DEFAULT_SOURCE_ROOT: &str = "/";
 pub const STARTUP_SLOT_DIR: &str = "startup";
 pub const MANUAL_SLOT_DIR: &str = "manual";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BackupSlot {
     Startup,
     Manual,
@@ -51,7 +49,7 @@ impl BackupSlot {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize)]
 pub struct BackupOperationResult {
     pub success: bool,
     pub action: String,
@@ -78,14 +76,11 @@ pub struct BackupManager {
 }
 
 impl BackupManager {
+    /// `backup_root` / `source_root` default to `/var/backups/error_detection` and `/`.
+    /// (Environment-variable overrides are resolved by the CLI in `main.rs`.)
     pub fn new(backup_root: Option<PathBuf>, source_root: Option<PathBuf>) -> Self {
-        let root = backup_root
-            .or_else(|| env::var("ERROR_DETECTION_BACKUP_DIR").ok().map(PathBuf::from))
-            .unwrap_or_else(|| PathBuf::from(DEFAULT_BACKUP_ROOT));
-
-        let src = source_root
-            .or_else(|| env::var("ERROR_DETECTION_BACKUP_SOURCE").ok().map(PathBuf::from))
-            .unwrap_or_else(|| PathBuf::from(DEFAULT_SOURCE_ROOT));
+        let root = backup_root.unwrap_or_else(|| PathBuf::from(DEFAULT_BACKUP_ROOT));
+        let src = source_root.unwrap_or_else(|| PathBuf::from(DEFAULT_SOURCE_ROOT));
 
         let startup_ts = read_slot_timestamp(&root, BackupSlot::Startup);
         let manual_ts = read_slot_timestamp(&root, BackupSlot::Manual);
@@ -140,6 +135,16 @@ impl BackupManager {
 
         // Enforce at most 2 backups by removing any unexpected directories in backup_root
         self.prune_extra_backup_dirs();
+
+        // Invalidate this slot while it is being overwritten so an interrupted/failed rsync
+        // leaves a slot that will never be selected for restore.
+        clear_slot_timestamp(&self.backup_root, slot);
+        if let Ok(mut st) = self.state.lock() {
+            match slot {
+                BackupSlot::Startup => st.startup_ts = None,
+                BackupSlot::Manual => st.manual_ts = None,
+            }
+        }
 
         let src_arg = ensure_trailing_slash(&self.source_root);
         let dst_arg = ensure_trailing_slash(&slot_dir);
@@ -465,6 +470,10 @@ fn slot_exists(backup_root: &Path, slot: BackupSlot) -> bool {
 fn write_slot_timestamp(backup_root: &Path, slot: BackupSlot, ts: u64) {
     let ts_path = backup_root.join(slot.timestamp_filename());
     let _ = fs::write(ts_path, format!("{ts}\n"));
+}
+
+fn clear_slot_timestamp(backup_root: &Path, slot: BackupSlot) {
+    let _ = fs::remove_file(backup_root.join(slot.timestamp_filename()));
 }
 
 fn read_slot_timestamp(backup_root: &Path, slot: BackupSlot) -> Option<u64> {
