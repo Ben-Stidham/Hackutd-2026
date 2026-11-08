@@ -12,22 +12,21 @@ socket.on('connect_error', (error) => {
 	console.error('Socket.IO connection failed:', error)
 })
 
-export async function getErrors(): Promise<unknown> {
+export async function getErrors(): Promise<string> {
 	return request('get_errors')
 }
 
-export async function getError(id: string | number): Promise<unknown> {
+export async function getError(id: string | number): Promise<string> {
 	return request('get_error', { id })
 }
 
-async function request(event: string, payload?: unknown): Promise<unknown> {
+async function request(event: string, payload?: unknown): Promise<string> {
 	const requestWithTimeout = socket.timeout(10_000)
 	const response: unknown =
 		payload === undefined
 			? await requestWithTimeout.emitWithAck(event)
 			: await requestWithTimeout.emitWithAck(event, payload)
-	await handleResponse(response)
-	return response
+	return handleResponse(response)
 }
 
 export async function handleResponse(response: unknown): Promise<string> {

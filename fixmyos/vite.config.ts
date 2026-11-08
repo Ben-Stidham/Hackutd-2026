@@ -17,4 +17,20 @@ export default defineConfig({
       '@': fileURLToPath(new URL('./src', import.meta.url)),
     },
   },
+  server: {
+    proxy: {
+      '/socket.io': {
+        target: 'http://localhost:8032',
+        ws: true,
+      },
+      '/api': {
+        target: 'http://localhost:8032',
+        rewrite: (path) => path.replace(/^\/api/, ''),
+      },
+      '/nemotron': {
+        target: 'http://localhost:8080',
+        rewrite: (path) => path.replace(/^\/nemotron/, ''),
+      },
+    },
+  },
 })

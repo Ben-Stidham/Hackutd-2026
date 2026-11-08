@@ -1,85 +1,83 @@
 <script setup lang="ts">
-import { RouterLink, RouterView } from 'vue-router'
-import HelloWorld from './components/HelloWorld.vue'
+import { RouterView } from 'vue-router'
 </script>
 
 <template>
-  <header>
-    <img alt="Vue logo" class="logo" src="@/assets/logo.svg" width="125" height="125" />
-
-    <div class="wrapper">
-      <HelloWorld msg="You did it!" />
-
-      <nav>
-        <RouterLink to="/">Home</RouterLink>
-        <RouterLink to="/about">About</RouterLink>
-      </nav>
-    </div>
-  </header>
-
-  <RouterView />
+  <div class="app-shell">
+    <header class="topbar">
+      <a class="brand" href="/" aria-label="Fix My OS home">
+        <span class="brand-mark" aria-hidden="true">FM</span>
+        <span>Fix My OS</span>
+      </a>
+      <div class="topbar-status">
+        <span class="status-dot" aria-hidden="true"></span>
+        LOCAL SESSION
+      </div>
+    </header>
+    <RouterView />
+  </div>
 </template>
 
-<style scoped>
-header {
-  line-height: 1.5;
-  max-height: 100vh;
+<style>
+.app-shell {
+  min-height: 100vh;
 }
 
-.logo {
-  display: block;
-  margin: 0 auto 2rem;
+.topbar {
+  height: 68px;
+  padding: 0 clamp(20px, 5vw, 72px);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  border-bottom: 1px solid #dce5df;
+  background: rgba(250, 252, 249, 0.88);
 }
 
-nav {
-  width: 100%;
-  font-size: 12px;
-  text-align: center;
-  margin-top: 2rem;
+.brand {
+  display: inline-flex;
+  align-items: center;
+  gap: 11px;
+  color: #172620;
+  text-decoration: none;
+  font-size: 15px;
+  font-weight: 700;
 }
 
-nav a.router-link-exact-active {
-  color: var(--color-text);
+.brand-mark {
+  width: 32px;
+  height: 32px;
+  display: grid;
+  place-items: center;
+  background: #d7ed74;
+  border-radius: 9px;
+  color: #25351b;
+  font: 800 11px/1 ui-monospace, monospace;
 }
 
-nav a.router-link-exact-active:hover {
-  background-color: transparent;
+.topbar-status {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: #66746d;
+  font: 600 10px/1 ui-monospace, monospace;
+  letter-spacing: 0.08em;
 }
 
-nav a {
-  display: inline-block;
-  padding: 0 1rem;
-  border-left: 1px solid var(--color-border);
+.status-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: #47a57b;
+  box-shadow: 0 0 0 3px #e0f1e7;
 }
 
-nav a:first-of-type {
-  border: 0;
-}
-
-@media (min-width: 1024px) {
-  header {
-    display: flex;
-    place-items: center;
-    padding-right: calc(var(--section-gap) / 2);
+@media (max-width: 520px) {
+  .topbar {
+    height: 60px;
   }
 
-  .logo {
-    margin: 0 2rem 0 0;
-  }
-
-  header .wrapper {
-    display: flex;
-    place-items: flex-start;
-    flex-wrap: wrap;
-  }
-
-  nav {
-    text-align: left;
-    margin-left: -1rem;
-    font-size: 1rem;
-
-    padding: 1rem 0;
-    margin-top: 1rem;
+  .topbar-status {
+    font-size: 9px;
   }
 }
 </style>
