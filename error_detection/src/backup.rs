@@ -366,6 +366,8 @@ impl BackupManager {
             "/var/backups/error_detection/**".to_string(),
             "/var/cache/**".to_string(),
             "/var/tmp/**".to_string(),
+            "/var/log/journal/**".to_string(),
+            "/var/lib/plasmalogin/.cache/**".to_string(),
             "/var/lib/libvirt/**".to_string(),
             "/var/lib/docker/**".to_string(),
             "/var/lib/containers/**".to_string(),
