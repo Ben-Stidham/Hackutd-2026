@@ -38,7 +38,7 @@ onMounted(async () => {
       <div class="response-box" :class="{ 'response-box--error': requestError }" aria-live="polite">
         <div class="response-gutter" aria-hidden="true"><span>AI</span></div>
         <div class="response-content">
-          <p v-if="loading" class="placeholder"><span class="loading-dot"></span> Reading system report...</p>
+          <p v-if="loading" class="placeholder"><span class="loading-dot"></span> Waiting for system report...</p>
           <p v-else-if="requestError" class="error-message">{{ requestError }}</p>
           <p v-else-if="response" class="response-text">{{ response }}</p>
           <p v-else class="placeholder">No response was returned.</p>

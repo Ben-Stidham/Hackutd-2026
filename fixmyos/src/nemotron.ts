@@ -5,6 +5,8 @@ type Message = {
 	content: string
 }
 
+const MAX_MODEL_LOADING_RETRIES = 8
+
 export class Nemotron {
 	private history: Message[] = [
 		{
@@ -17,25 +19,51 @@ export class Nemotron {
 		this.history.push({ role: 'user', content: question })
 
 		try {
-			const response = await fetch(API_URL, {
-				method: 'POST',
-				headers: { 'Content-Type': 'application/json' },
-				body: JSON.stringify({
-					model: 'nemotron',
-					messages: this.history,
-					temperature: 1.0,
-					max_tokens: 1024,
-				}),
-			})
+			for (let attempt = 0; ; attempt++) {
+				const response = await fetch(API_URL, {
+					method: 'POST',
+					headers: { 'Content-Type': 'application/json' },
+					body: JSON.stringify({
+						model: 'nemotron',
+						messages: this.history,
+						temperature: 1.0,
+						max_tokens: 4096,
+						chat_template_kwargs: { enable_thinking: false },
+					}),
+				})
 
-			if (!response.ok) {
-				throw new Error(`HTTP ${response.status}: ${await response.text()}`)
+				if (!response.ok) {
+					const details = await response.text()
+					if (response.status === 503 && /loading model/i.test(details)) {
+						if (attempt < MAX_MODEL_LOADING_RETRIES) {
+							const delay = Math.min(1000 * 2 ** attempt, 5000)
+							await new Promise((resolve) => setTimeout(resolve, delay))
+							continue
+						}
+						throw new Error('Nemotron is still loading the model. Please try again shortly.')
+					}
+					if (response.status === 502) {
+						throw new Error(
+							'Nemotron returned HTTP 502. The frontend proxy is reachable, but the service or SSH tunnel behind localhost:8080 is not responding.',
+						)
+					}
+					throw new Error(`Nemotron HTTP ${response.status}: ${details || 'No response details.'}`)
+				}
+
+				const data = await response.json()
+				const answer: string | undefined = data.choices?.[0]?.message?.content
+				if (!answer?.trim()) {
+					const finishReason = data.choices?.[0]?.finish_reason
+					throw new Error(
+						finishReason === 'length'
+							? 'Nemotron used its response token limit before producing a visible answer.'
+							: 'Nemotron returned an empty answer.',
+					)
+				}
+
+				this.history.push({ role: 'assistant', content: answer })
+				return answer
 			}
-
-			const data = await response.json()
-			const answer: string = data.choices[0].message.content
-			this.history.push({ role: 'assistant', content: answer })
-			return answer
 		} catch (error) {
 			this.history.pop()
 			throw error
