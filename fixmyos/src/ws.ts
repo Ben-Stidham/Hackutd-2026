@@ -4,9 +4,18 @@ import { Nemotron } from './nemotron'
 
 export type WorkflowPhase = 'loading' | 'approval' | 'running' | 'complete' | 'error'
 
+export type ExecutedCommand = {
+	command: string
+	exitCode?: number
+	stdout: string
+	stderr: string
+	simulated?: boolean
+}
+
 export type WorkflowState = {
 	phase: WorkflowPhase
 	response: string
+	commandHistory?: ExecutedCommand[]
 	situation?: string
 	planItems?: string[]
 	processNumber?: number
@@ -44,6 +53,7 @@ let stateListener: StateListener | undefined
 let processIds: string[] = []
 let currentProcessIndex = 0
 let currentCommand: string | undefined
+let commandHistory: ExecutedCommand[] = []
 let mockMode = false
 let mockProcessIndex = 0
 let mockCommandIndex = 0
@@ -82,6 +92,7 @@ export function startRecoveryWorkflow(onState: StateListener): void {
 	processIds = []
 	currentProcessIndex = 0
 	currentCommand = undefined
+	commandHistory = []
 	nemotron.reset()
 	void findProcesses()
 }
@@ -91,6 +102,7 @@ export function startMockRecoveryWorkflow(onState: StateListener): void {
 	stateListener = onState
 	mockProcessIndex = 0
 	mockCommandIndex = 0
+	commandHistory = []
 	showMockStep()
 }
 
@@ -134,10 +146,12 @@ export async function respondToCommand(approved: boolean): Promise<void> {
 
 	const command = currentCommand
 	currentCommand = undefined
-	updateState({ phase: 'running', response: 'Running the approved command...' })
+	updateState({ phase: 'running', response: 'Running the approved command...', command })
 
 	try {
 		const result = await requestSocket<unknown>('run_command', 'command_result', { command })
+		commandHistory.push(toExecutedCommand(command, result))
+		updateState({ phase: 'running', response: 'Reviewing command output...' })
 		const answer = await nemotron.ask(
 			`${agentInstructions}\n\nCommand result:\n${promptJson(result, 10_000)}\n\n` +
 				'Continue analyzing this process. Start with a short `### Situation` section explaining what is happening and what you are doing. ' +
@@ -150,6 +164,7 @@ export async function respondToCommand(approved: boolean): Promise<void> {
 		updateState({
 			phase: 'error',
 			response: '',
+			command,
 			error: error instanceof Error ? error.message : 'The approved command failed.',
 		})
 	}
@@ -158,6 +173,7 @@ export async function respondToCommand(approved: boolean): Promise<void> {
 async function respondToMockCommand(approved: boolean): Promise<void> {
 	const process = mockProcesses[mockProcessIndex]
 	if (!process) return
+	const command = process.commands[mockCommandIndex]
 
 	updateState({
 		phase: 'running',
@@ -166,10 +182,20 @@ async function respondToMockCommand(approved: boolean): Promise<void> {
 			: 'Simulating soft restore. No volume was changed.',
 		processNumber: mockProcessIndex + 1,
 		processCount: mockProcesses.length,
+		command: approved ? command : undefined,
 	})
 	await new Promise((resolve) => window.setTimeout(resolve, 650))
 
-	if (approved) mockCommandIndex++
+	if (approved && command) {
+		commandHistory.push({
+			command,
+			exitCode: 0,
+			stdout: `Mock output for: ${command}\nLorem ipsum dolor sit amet, consectetur adipiscing elit.`,
+			stderr: '',
+			simulated: true,
+		})
+		mockCommandIndex++
+	}
 	else mockCommandIndex = process.commands.length
 
 	if (mockCommandIndex >= process.commands.length) {
@@ -405,5 +431,18 @@ function requestBackup(
 }
 
 function updateState(state: WorkflowState): void {
-	stateListener?.(state)
+	stateListener?.({ ...state, commandHistory: [...commandHistory] })
+}
+
+function toExecutedCommand(command: string, result: unknown): ExecutedCommand {
+	const data = typeof result === 'object' && result !== null ? (result as Record<string, unknown>) : {}
+	const rawExitCode = data.exit_code ?? data.exitCode
+	const parsedExitCode = typeof rawExitCode === 'number' ? rawExitCode : Number(rawExitCode)
+
+	return {
+		command,
+		exitCode: Number.isFinite(parsedExitCode) ? parsedExitCode : undefined,
+		stdout: typeof data.stdout === 'string' ? data.stdout : '',
+		stderr: typeof data.stderr === 'string' ? data.stderr : '',
+	}
 }

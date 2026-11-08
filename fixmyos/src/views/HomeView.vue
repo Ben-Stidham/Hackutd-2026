@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { computed, onMounted, ref } from 'vue'
 import {
   developmentMockMode,
   respondToCommand,
@@ -11,56 +11,52 @@ import {
 
 const workflow = ref<WorkflowState>({ phase: 'loading', response: 'Starting review...' })
 const latestPlan = ref<string[]>([])
+const futureCommands = computed(() => {
+  if (!workflow.value.command) return []
+  const activeIndex = latestPlan.value.indexOf(workflow.value.command)
+  return activeIndex < 0 ? latestPlan.value : latestPlan.value.slice(activeIndex + 1)
+})
+const pidTotal = ref<number>()
+const activePidNumber = ref<number>()
+const queueRemaining = computed(() => {
+  if (workflow.value.phase === 'complete') return 0
+  if (pidTotal.value === undefined || activePidNumber.value === undefined) return undefined
+  return Math.max(pidTotal.value - activePidNumber.value + 1, 0)
+})
+const queueSegmentDash = computed(() => {
+  const totalSegments = pidTotal.value ?? 0
+  if (totalSegments === 0) return '0 100'
+
+  const segmentUnit = 100 / totalSegments
+  const segmentGap = Math.min(1.3, segmentUnit * 0.35)
+  return `${segmentUnit - segmentGap} ${segmentGap}`
+})
+const queueLitSegmentDash = computed(() => {
+  const totalSegments = pidTotal.value ?? 0
+  if (totalSegments === 0) return '0 100'
+
+  const litSegments = queueRemaining.value ?? 0
+  const segmentUnit = 100 / totalSegments
+  const segmentGap = Math.min(1.3, segmentUnit * 0.35)
+  const segmentLength = segmentUnit - segmentGap
+  return Array.from({ length: totalSegments }, (_, index) =>
+    index < litSegments ? `${segmentLength} ${segmentGap}` : `0 ${segmentUnit}`,
+  ).join(' ')
+})
 const backupBusy = ref(false)
 const backupMessage = ref('')
-const responseTextElement = ref<HTMLParagraphElement | null>(null)
-const responseHasMore = ref(false)
-const responseExpanded = ref(false)
-
-function measureResponseOverflow(): void {
-  const element = responseTextElement.value
-  if (!element || responseExpanded.value) return
-  responseHasMore.value = element.scrollHeight > element.clientHeight + 1
-}
-
-const responseResizeObserver =
-  typeof ResizeObserver === 'undefined' ? undefined : new ResizeObserver(measureResponseOverflow)
-
-watch(
-  responseTextElement,
-  async (element, previousElement) => {
-    if (previousElement) responseResizeObserver?.unobserve(previousElement)
-    if (!element) {
-      responseHasMore.value = false
-      return
-    }
-    responseResizeObserver?.observe(element)
-    await nextTick()
-    measureResponseOverflow()
-  },
-  { flush: 'post' },
-)
-
-watch(
-  () => [workflow.value.situation, workflow.value.phase, workflow.value.processNumber],
-  async () => {
-    responseExpanded.value = false
-    await nextTick()
-    measureResponseOverflow()
-  },
-  { flush: 'post' },
-)
 
 onMounted(() => {
   const onState = (state: WorkflowState) => {
     workflow.value = state
     if (state.planItems) latestPlan.value = state.planItems
+    if (state.processCount !== undefined) pidTotal.value = state.processCount
+    if (state.processNumber !== undefined) activePidNumber.value = state.processNumber
   }
 
   if (developmentMockMode) startMockRecoveryWorkflow(onState)
   else startRecoveryWorkflow(onState)
 })
-onBeforeUnmount(() => responseResizeObserver?.disconnect())
 
 async function restoreHardBackup(): Promise<void> {
   if (
@@ -97,7 +93,7 @@ async function restoreHardBackup(): Promise<void> {
       <section class="context-panel" aria-labelledby="analysis-title">
         <div class="panel-heading">
           <div>
-            <div class="section-kicker">01 / ANALYSIS</div>
+            <div class="section-kicker">01 / CONTEXT</div>
             <h2 id="analysis-title">System context</h2>
           </div>
           <span class="live-label">
@@ -113,50 +109,109 @@ async function restoreHardBackup(): Promise<void> {
           </p>
           <p v-else-if="workflow.phase === 'error'" class="error-message">{{ workflow.error }}</p>
           <template v-else-if="workflow.situation">
-            <p
-              id="ai-response-description"
-              ref="responseTextElement"
-              class="situation-copy"
-              :class="{ 'situation-copy--expanded': responseExpanded }"
-            >
-              {{ workflow.situation }}
-            </p>
-            <button
-              v-if="responseHasMore"
-              class="response-toggle"
-              type="button"
-              aria-controls="ai-response-description"
-              :aria-expanded="responseExpanded"
-              @click="responseExpanded = !responseExpanded"
-            >
-              {{ responseExpanded ? 'View less' : 'View more' }}
-            </button>
+            <p class="situation-copy">{{ workflow.situation }}</p>
           </template>
           <p v-else class="placeholder">No active process description.</p>
         </section>
+      </section>
 
-        <section class="plan-block" aria-labelledby="plan-title">
+      <section class="queue-panel" aria-labelledby="queue-title">
+          <div class="queue-heading">
+            <div>
+              <div class="section-kicker">03 / QUEUE</div>
+              <h3 id="queue-title">Processes remaining</h3>
+            </div>
+            <div class="queue-count" aria-live="polite">
+              <strong>{{ queueRemaining ?? '--' }}</strong>
+              <span>REMAINING</span>
+            </div>
+          </div>
+          <div class="queue-graphic">
+            <svg
+              class="queue-ring"
+              viewBox="0 0 120 120"
+              role="img"
+              :aria-label="queueRemaining === undefined ? 'Scanning process queue' : `${queueRemaining} of ${pidTotal ?? 0} process IDs remain, including the active process`"
+            >
+              <circle
+                class="queue-ring-track"
+                cx="60"
+                cy="60"
+                r="47"
+                pathLength="100"
+                transform="rotate(-90 60 60)"
+                :stroke-dasharray="queueSegmentDash"
+              />
+              <circle
+                class="queue-ring-segments"
+                cx="60"
+                cy="60"
+                r="47"
+                pathLength="100"
+                transform="rotate(-90 60 60)"
+                :stroke-dasharray="queueLitSegmentDash"
+              />
+              <text class="queue-ring-value" x="60" y="58">{{ queueRemaining ?? '--' }}</text>
+              <text class="queue-ring-caption" x="60" y="74">LEFT</text>
+            </svg>
+            <div class="queue-chart-labels">
+              <span v-if="workflow.phase === 'complete'">QUEUE CLEAR</span>
+              <span v-else-if="workflow.processNumber">ACTIVE {{ workflow.processNumber }} / {{ pidTotal }}</span>
+              <span v-else>SCANNING QUEUE</span>
+              <span>{{ pidTotal ?? '--' }} TOTAL</span>
+            </div>
+          </div>
+      </section>
+
+      <section class="plan-panel" aria-labelledby="plan-title">
           <div class="plan-heading">
             <div>
-              <div class="section-kicker">02 / CURRENT APPROACH</div>
-              <h3 id="plan-title">Latest plan</h3>
+              <div class="section-kicker">02 / PLAN</div>
+              <h3 id="plan-title">Command timeline</h3>
             </div>
-            <span class="plan-count">{{ String(latestPlan.length).padStart(2, '0') }} STEPS</span>
+            <span class="plan-count">{{ String((workflow.commandHistory?.length ?? 0) + (workflow.command ? 1 : 0) + futureCommands.length).padStart(2, '0') }} STEPS</span>
           </div>
-          <ol v-if="latestPlan.length" class="plan-list">
-            <li v-for="(item, index) in latestPlan" :key="`${index}-${item}`" class="plan-item">
-              <span class="plan-index">{{ String(index + 1).padStart(2, '0') }}</span>
-              <span>{{ item }}</span>
+          <ol v-if="workflow.commandHistory?.length || workflow.command || futureCommands.length" class="plan-list">
+            <li v-for="(execution, index) in workflow.commandHistory" :key="`history-${index}-${execution.command}`" class="plan-item plan-item--executed">
+              <details class="history-disclosure">
+                <summary class="timeline-row">
+                  <span class="plan-index">{{ String(index + 1).padStart(2, '0') }}</span>
+                  <span class="timeline-state">{{ execution.simulated ? 'SIMULATED' : 'EXECUTED' }}</span>
+                  <code>{{ execution.command }}</code>
+                  <span class="timeline-arrow" aria-hidden="true"></span>
+                </summary>
+                <div class="history-output">
+                  <div class="output-meta">{{ execution.simulated ? 'MOCK OUTPUT' : `EXIT ${execution.exitCode ?? 'UNKNOWN'}` }}</div>
+                  <div v-if="execution.stdout" class="output-stream">
+                    <span>STDOUT</span>
+                    <pre>{{ execution.stdout }}</pre>
+                  </div>
+                  <div v-if="execution.stderr" class="output-stream output-stream--error">
+                    <span>STDERR</span>
+                    <pre>{{ execution.stderr }}</pre>
+                  </div>
+                  <p v-if="!execution.stdout && !execution.stderr" class="output-empty">No console output.</p>
+                </div>
+              </details>
+            </li>
+            <li v-if="workflow.command" class="plan-item plan-item--current">
+              <span class="plan-index">{{ String((workflow.commandHistory?.length ?? 0) + 1).padStart(2, '0') }}</span>
+              <span class="timeline-state">{{ workflow.phase === 'running' ? 'RUNNING' : 'CURRENT' }}</span>
+              <code>{{ workflow.command }}</code>
+            </li>
+            <li v-for="(item, index) in futureCommands" :key="`future-${index}-${item}`" class="plan-item plan-item--future">
+              <span class="plan-index">{{ String((workflow.commandHistory?.length ?? 0) + index + 2).padStart(2, '0') }}</span>
+              <span class="timeline-state">UP NEXT</span>
+              <code>{{ item }}</code>
             </li>
           </ol>
-          <p v-else class="plan-empty">The plan will appear after the process is analyzed.</p>
-        </section>
+          <p v-else class="plan-empty">Executed commands and upcoming steps will appear here.</p>
       </section>
 
       <section class="action-panel" aria-labelledby="action-title">
         <div class="panel-heading">
           <div>
-            <div class="section-kicker">03 / ACTION</div>
+            <div class="section-kicker">04 / ACTION</div>
             <h2 id="action-title">Command review</h2>
           </div>
           <span class="action-state" :class="`action-state--${workflow.phase}`">{{ workflow.phase.toUpperCase() }}</span>
@@ -231,21 +286,6 @@ async function restoreHardBackup(): Promise<void> {
   display: flex;
   justify-content: space-between;
   align-items: center;
-}
-
-.intro-actions {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 20px;
-}
-
-.eyebrow,
-.section-kicker,
-.live-label,
-.workspace-footer {
-  font: 650 10px/1.2 ui-monospace, monospace;
-  letter-spacing: 0;
 }
 
 .eyebrow {
@@ -888,15 +928,23 @@ h1 span {
 .console-grid {
   flex: 1;
   display: grid;
-  grid-template-columns: minmax(0, 1.15fr) minmax(340px, 0.85fr);
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  grid-template-rows: minmax(0, 2fr) minmax(210px, 1fr);
+  grid-template-areas:
+    'context plan'
+    'queue action';
   align-items: stretch;
-  min-height: max(430px, calc(100svh - 190px));
+  min-height: 0;
   gap: 6px;
 }
 
 .context-panel,
+.queue-panel,
+.plan-panel,
 .action-panel {
   min-width: 0;
+  min-height: 0;
+  overflow: auto;
   border: 1px solid #303a32;
   border-radius: 4px;
   background: rgba(22, 27, 23, 0.92);
@@ -905,17 +953,29 @@ h1 span {
 }
 
 .context-panel {
+  grid-area: context;
   display: flex;
   flex-direction: column;
   padding: 8px 9px 9px;
 }
 
+.queue-panel {
+  grid-area: queue;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  padding: 14px;
+}
+
+.plan-panel {
+  grid-area: plan;
+  padding: 12px;
+}
+
 .action-panel {
-  position: sticky;
-  top: 18px;
-  align-self: center;
-  width: 100%;
-  min-height: clamp(260px, 40svh, 420px);
+  grid-area: action;
+  align-self: stretch;
+  min-height: 0;
   display: flex;
   flex-direction: column;
   padding: 8px;
@@ -966,10 +1026,6 @@ h1 span {
 }
 
 .situation-copy {
-  display: -webkit-box;
-  -webkit-box-orient: vertical;
-  -webkit-line-clamp: 4;
-  overflow: hidden;
   margin: 0;
   color: #d3ddd4;
   font-size: 14px;
@@ -978,10 +1034,92 @@ h1 span {
   overflow-wrap: anywhere;
 }
 
-.situation-copy--expanded {
+.queue-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.queue-heading h3 {
+  margin: 0;
+  color: #e8eee8;
+  font-size: 15px;
+  font-weight: 650;
+}
+
+.queue-count {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+
+.queue-count strong {
+  color: #dcff68;
+  font: 650 25px/1 ui-monospace, 'SFMono-Regular', Consolas, monospace;
+}
+
+.queue-count span,
+.queue-chart-labels {
+  color: #849087;
+  font: 600 8px/1.3 ui-monospace, 'SFMono-Regular', Consolas, monospace;
+}
+
+.queue-graphic {
+  flex: 1;
+  display: grid;
+  align-content: center;
+  justify-items: center;
+  gap: 12px;
+  padding-top: 12px;
+}
+
+.queue-ring {
   display: block;
-  -webkit-line-clamp: unset;
+  width: clamp(88px, 12svh, 124px);
+  aspect-ratio: 1;
   overflow: visible;
+}
+
+.queue-ring-track,
+.queue-ring-segments {
+  fill: none;
+  stroke-width: 5;
+}
+
+.queue-ring-track {
+  stroke: #303a32;
+}
+
+.queue-ring-segments {
+  stroke: #dcff68;
+  stroke-linecap: butt;
+  filter: drop-shadow(0 0 3px rgba(220, 255, 104, 0.2));
+  transition: stroke-dasharray 350ms ease;
+}
+
+.queue-ring-value,
+.queue-ring-caption {
+  text-anchor: middle;
+  font-family: ui-monospace, 'SFMono-Regular', Consolas, monospace;
+}
+
+.queue-ring-value {
+  fill: #dcff68;
+  font-size: 25px;
+  font-weight: 700;
+}
+
+.queue-ring-caption {
+  fill: #849087;
+  font-size: 7px;
+  font-weight: 600;
+}
+
+.queue-chart-labels {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
 }
 
 .response-content {
@@ -993,10 +1131,8 @@ h1 span {
 }
 
 .plan-block {
-  flex: 1;
-  margin-top: auto;
+  min-height: 100%;
   padding-top: 7px;
-  border-top: 1px solid #303a32;
 }
 
 .plan-heading {
@@ -1020,16 +1156,114 @@ h1 span {
 
 .plan-item {
   display: grid;
-  grid-template-columns: 35px minmax(0, 1fr);
+  grid-template-columns: 30px 72px minmax(0, 1fr) 14px;
   align-items: start;
-  gap: 10px;
-  padding: 7px 0;
+  gap: 8px;
+  padding: 8px 6px;
   border-top: 1px solid #272f29;
   color: #d5ded5;
-  font-size: 14px;
-  line-height: 1.65;
+  font-size: 12px;
+  line-height: 1.55;
   overflow-wrap: anywhere;
   animation: rise-in 300ms ease-out both;
+}
+
+.plan-item--current {
+  border: 1px solid #71844a;
+  border-left: 3px solid #dcff68;
+  border-radius: 3px;
+  background: rgba(220, 255, 104, 0.07);
+  color: #eff5e8;
+}
+
+.plan-item--future {
+  margin-left: 22px;
+  opacity: 0.72;
+}
+
+.history-disclosure {
+  grid-column: 1 / -1;
+  min-width: 0;
+}
+
+.timeline-row {
+  display: grid;
+  grid-template-columns: 30px 72px minmax(0, 1fr) 14px;
+  align-items: start;
+  gap: 8px;
+  cursor: pointer;
+  list-style: none;
+}
+
+.timeline-row::-webkit-details-marker {
+  display: none;
+}
+
+.timeline-row code,
+.plan-item > code {
+  min-width: 0;
+  color: inherit;
+  font: 11px/1.6 ui-monospace, 'SFMono-Regular', Consolas, monospace;
+  overflow-wrap: anywhere;
+}
+
+.timeline-state {
+  padding-top: 2px;
+  color: #8d9990;
+  font: 600 8px/1.4 ui-monospace, 'SFMono-Regular', Consolas, monospace;
+}
+
+.plan-item--current .timeline-state {
+  color: #dcff68;
+}
+
+.timeline-arrow {
+  width: 7px;
+  height: 7px;
+  margin: 4px 3px 0 0;
+  border-right: 1px solid #aeb8af;
+  border-bottom: 1px solid #aeb8af;
+  transform: rotate(45deg);
+  transition: transform 150ms ease;
+}
+
+.history-disclosure[open] .timeline-arrow {
+  transform: rotate(225deg);
+}
+
+.history-output {
+  display: grid;
+  gap: 8px;
+  margin: 10px 0 2px 38px;
+  padding: 10px;
+  border-left: 1px solid #46533c;
+  background: #0c100d;
+}
+
+.output-meta,
+.output-stream > span {
+  color: #849087;
+  font: 600 8px/1.3 ui-monospace, 'SFMono-Regular', Consolas, monospace;
+}
+
+.output-stream pre {
+  max-height: 200px;
+  overflow: auto;
+  margin: 4px 0 0;
+  color: #cbd6cc;
+  font: 10px/1.55 ui-monospace, 'SFMono-Regular', Consolas, monospace;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.output-stream--error pre {
+  color: #f08a6b;
+}
+
+.output-empty {
+  margin: 0;
+  color: #78847b;
+  font-size: 10px;
 }
 
 .plan-index {
@@ -1065,7 +1299,7 @@ h1 span {
   flex: 1 1 auto;
   display: grid;
   gap: 7px;
-  min-height: 120px;
+  min-height: 84px;
   align-content: start;
   margin-top: 8px;
   padding: 9px;
@@ -1192,12 +1426,22 @@ h1 span {
   .console-grid {
     flex: initial;
     grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: auto;
+    grid-template-areas:
+      'context'
+      'queue'
+      'plan'
+      'action';
     min-height: 0;
     gap: 6px;
   }
 
-  .context-panel {
+  .context-panel,
+  .queue-panel,
+  .plan-panel,
+  .action-panel {
     min-height: 0;
+    overflow: visible;
   }
 
   .situation-block {
@@ -1209,6 +1453,10 @@ h1 span {
     position: static;
     align-self: stretch;
     min-height: 0;
+  }
+
+  .queue-panel {
+    min-height: 120px;
   }
 
   .command-block {
@@ -1228,12 +1476,15 @@ h1 span {
   }
 
   .context-panel,
+  .queue-panel,
+  .plan-panel,
   .action-panel {
     padding: 7px;
   }
 
   .panel-heading h2,
-  .plan-heading h3 {
+  .plan-heading h3,
+  .queue-heading h3 {
     font-size: 15px;
   }
 
