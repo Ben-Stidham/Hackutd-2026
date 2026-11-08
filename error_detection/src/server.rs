@@ -453,6 +453,7 @@ mod tests {
             stdout_path: None,
             stderr_path: None,
             systemd_unit: None,
+            spawned_by_daemon: false,
         };
         db.insert_error(
             &ev,

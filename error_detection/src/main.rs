@@ -479,8 +479,8 @@ fn should_record_error(
     if ev.exit_code == 0 {
         return false;
     }
-    // Ignore the daemon itself or direct helper children spawned by the daemon (e.g. journalctl)
-    if ev.tgid == daemon_pid || ev.parent_pid == daemon_pid {
+    // Ignore the daemon itself or helper children spawned by the daemon (e.g. journalctl, rsync)
+    if ev.tgid == daemon_pid || ev.parent_pid == daemon_pid || ev.spawned_by_daemon {
         return false;
     }
     if ignored_comms.contains(&ev.comm) {
@@ -530,6 +530,7 @@ mod tests {
             stdout_path: None,
             stderr_path: None,
             systemd_unit: None,
+            spawned_by_daemon: false,
         }
     }
 
@@ -574,6 +575,7 @@ mod tests {
             stdout_path: None,
             stderr_path: None,
             systemd_unit: None,
+            spawned_by_daemon: false,
         };
         let (summary, body) = format_exit_details(&ev);
         assert_eq!(summary, "Process 'backup-job' (PID 4242) exited with code 2");
@@ -601,6 +603,7 @@ mod tests {
             stdout_path: None,
             stderr_path: None,
             systemd_unit: None,
+            spawned_by_daemon: false,
         };
         let (summary, body) = format_exit_details(&ev);
         db.insert_error(&ev, &summary, &body, "hello stdout\nline 2", "fatal stderr\nboom")
