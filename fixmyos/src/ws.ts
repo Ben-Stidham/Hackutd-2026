@@ -7,6 +7,8 @@ export type WorkflowPhase = 'loading' | 'approval' | 'running' | 'complete' | 'e
 export type WorkflowState = {
 	phase: WorkflowPhase
 	response: string
+	situation?: string
+	planItems?: string[]
 	processNumber?: number
 	processCount?: number
 	command?: string
@@ -87,7 +89,9 @@ export async function respondToCommand(approved: boolean): Promise<void> {
 		const result = await requestSocket<unknown>('run_command', 'command_result', { command })
 		const answer = await nemotron.ask(
 			`${agentInstructions}\n\nCommand result:\n${promptJson(result, 10_000)}\n\n` +
-				'Continue analyzing this process. If another command is needed, put only the next command in a level-two heading (## command). ' +
+				'Continue analyzing this process. Start with a short `### Situation` section explaining what is happening and what you are doing. ' +
+				'Use level-two headings in the required format for commands; these command headings are the plan shown to the user. ' +
+				'Keep execution sequential: provide only the next justified command and wait for its result before naming another command. ' +
 				'If no more commands are needed for this process, include the exact heading ## DONE.',
 		)
 		await showModelStep(answer)
@@ -152,7 +156,10 @@ async function loadCurrentProcess(): Promise<void> {
 		const answer = await nemotron.ask(
 			`${agentInstructions}\n\nAdditional information for process ID ${processId}:\n` +
 				`${promptJson(details)}\n\n` +
-				'Analyze this process and follow the required output format. If no command is needed, include the exact heading ## DONE.',
+				'Analyze this process and follow the required output format. Start with a short `### Situation` section explaining what is happening and what you are doing. ' +
+				'Use level-two headings in the required format for commands; these command headings are the plan shown to the user. ' +
+				'Keep execution sequential: provide only the next justified command and wait for its result before naming another command. ' +
+				'If no command is needed, include the exact heading ## DONE.',
 		)
 		await showModelStep(answer)
 	} catch (error) {
@@ -185,13 +192,41 @@ async function showModelStep(answer: string): Promise<void> {
 	}
 
 	currentCommand = next.command
+	const situation = extractSection(answer, 'Situation')
+	const planItems = extractPlanItems(answer)
 	updateState({
 		phase: 'approval',
 		response: answer,
+		situation: situation || answerBeforeCommand(answer),
+		planItems,
 		processNumber: currentProcessIndex + 1,
 		processCount: processIds.length,
 		command: next.command,
 	})
+}
+
+function extractSection(answer: string, sectionName: string): string {
+	const escapedName = sectionName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+	const heading = new RegExp(`^#{2,3}\\s+${escapedName}\\s*$`, 'im').exec(answer)
+	if (!heading) return ''
+
+	const contentStart = heading.index + heading[0].length
+	const content = answer.slice(contentStart)
+	const nextHeading = content.search(/^#{1,3}\s+/m)
+	return content.slice(0, nextHeading < 0 ? undefined : nextHeading).trim()
+}
+
+function extractPlanItems(answer: string): string[] {
+	return [...answer.matchAll(/^##\s+(.+?)\s*$/gim)]
+		.map((match) => match[1]?.trim().replace(/^`|`$/g, '') ?? '')
+		.filter((command) => command.length > 0 && !/^(?:done|no more commands?)\b/i.test(command))
+}
+
+function answerBeforeCommand(answer: string): string {
+	return (answer.split(/^##\s+/m, 1)[0] ?? answer)
+		.replace(/^#.+$/gm, '')
+		.replace(/^###\s+(?:Situation|Plan)\s*$/gim, '')
+		.trim()
 }
 
 function parseProcessIds(answer: string): string[] {

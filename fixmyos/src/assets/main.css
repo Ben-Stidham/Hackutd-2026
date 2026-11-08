@@ -1,24 +1,34 @@
 @import './base.css';
 
 :root {
-  color-scheme: light;
+  color-scheme: dark;
+  --canvas: #111411;
+  --paper: #191e1a;
+  --ink: #f0f3ed;
+  --muted: #9aa69c;
+  --line: #343c35;
+  --signal: #dcff68;
+  --signal-ink: #202719;
+  --alert: #f08a6b;
   font-family: 'Avenir Next', 'Segoe UI', sans-serif;
   font-synthesis: none;
   text-rendering: optimizeLegibility;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
-  background: #f3f6f1;
-  color: #26342c;
+  background: var(--canvas);
+  color: var(--ink);
 }
 
 body {
   display: block;
   min-width: 320px;
   min-height: 100vh;
-  background:
-    radial-gradient(ellipse at 87% 4%, rgba(216, 232, 183, 0.32), transparent 30rem),
-    #f3f6f1;
-  color: #26342c;
+  background-color: var(--canvas);
+  background-image:
+    linear-gradient(rgba(197, 216, 198, 0.025) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(197, 216, 198, 0.025) 1px, transparent 1px);
+  background-size: 36px 36px;
+  color: var(--ink);
   font-family: 'Avenir Next', 'Segoe UI', sans-serif;
   font-size: 14px;
   line-height: 1.5;
