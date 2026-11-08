@@ -1,10 +1,38 @@
 <script setup lang="ts">
 import { onMounted, ref } from 'vue'
-import { respondToCommand, startRecoveryWorkflow, type WorkflowState } from '../ws'
+import {
+  respondToCommand,
+  restoreStartupBackup,
+  startRecoveryWorkflow,
+  type WorkflowState,
+} from '../ws'
 
 const workflow = ref<WorkflowState>({ phase: 'loading', response: 'Starting review...' })
+const backupBusy = ref(false)
+const backupMessage = ref('')
 
 onMounted(() => startRecoveryWorkflow((state) => (workflow.value = state)))
+
+async function restoreHardBackup(): Promise<void> {
+  if (
+    !window.confirm(
+      'Restore the startup snapshot from when the daemon first ran? This will roll the system back to that state.',
+    )
+  ) {
+    return
+  }
+
+  backupBusy.value = true
+  backupMessage.value = 'Restoring the startup snapshot...'
+  try {
+    const result = await restoreStartupBackup()
+    backupMessage.value = result.stdout || 'Startup snapshot restore requested.'
+  } catch (error) {
+    backupMessage.value = error instanceof Error ? error.message : 'Unable to restore the startup snapshot.'
+  } finally {
+    backupBusy.value = false
+  }
+}
 </script>
 
 <template>
@@ -12,7 +40,20 @@ onMounted(() => startRecoveryWorkflow((state) => (workflow.value = state)))
     <section class="intro" aria-labelledby="page-title">
       <div class="eyebrow"><span class="eyebrow-line"></span> SYSTEM RECOVERY</div>
       <h1 id="page-title">A clearer path<br /><span>back to stable.</span></h1>
-      <p class="intro-copy">Review the diagnosis, then decide what happens next.</p>
+      <div class="intro-actions">
+        <p class="intro-copy">Review the diagnosis, then decide what happens next.</p>
+        <div class="hard-restore-control">
+          <button
+            class="hard-restore-button"
+            type="button"
+            :disabled="backupBusy || workflow.phase === 'loading' || workflow.phase === 'running'"
+            @click="restoreHardBackup"
+          >
+            Restore startup snapshot
+          </button>
+          <p v-if="backupMessage" class="backup-message" role="status">{{ backupMessage }}</p>
+        </div>
+      </div>
     </section>
 
     <section class="analysis-section" aria-labelledby="analysis-title">
@@ -79,6 +120,13 @@ onMounted(() => startRecoveryWorkflow((state) => (workflow.value = state)))
   margin-bottom: 54px;
 }
 
+.intro-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 20px;
+}
+
 .eyebrow,
 .section-kicker,
 .live-label,
@@ -116,6 +164,41 @@ h1 span {
   margin-top: 18px;
   color: #65756c;
   font-size: 15px;
+}
+
+.hard-restore-control {
+  display: grid;
+  justify-items: end;
+  gap: 6px;
+}
+
+.hard-restore-button {
+  min-height: 40px;
+  padding: 0 14px;
+  border: 1px solid #bd8f80;
+  border-radius: 5px;
+  background: #fffaf7;
+  color: #814a3a;
+  font: 650 12px/1.3 ui-monospace, 'SFMono-Regular', Consolas, monospace;
+  cursor: pointer;
+}
+
+.hard-restore-button:focus-visible {
+  outline: 3px solid #c99882;
+  outline-offset: 3px;
+}
+
+.hard-restore-button:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+
+.backup-message {
+  max-width: 380px;
+  color: #814a3a;
+  font: 11px/1.5 ui-monospace, 'SFMono-Regular', Consolas, monospace;
+  text-align: right;
+  overflow-wrap: anywhere;
 }
 
 .analysis-section {
@@ -368,6 +451,20 @@ h1 span {
 
   .intro {
     margin-bottom: 39px;
+  }
+
+  .intro-actions {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 14px;
+  }
+
+  .hard-restore-control {
+    justify-items: start;
+  }
+
+  .backup-message {
+    text-align: left;
   }
 
   .approval-panel {

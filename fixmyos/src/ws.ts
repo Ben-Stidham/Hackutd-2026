@@ -15,6 +15,15 @@ export type WorkflowState = {
 
 type StateListener = (state: WorkflowState) => void
 
+type BackupResponse = {
+	success?: boolean
+	snapshot_name?: string
+	stdout?: string
+	stderr?: string
+	error?: string
+	message?: string
+}
+
 const nemotron = new Nemotron()
 const socket = io(import.meta.env.VITE_SOCKET_URL || window.location.origin, {
 	path: '/socket.io',
@@ -45,12 +54,30 @@ export function startRecoveryWorkflow(onState: StateListener): void {
 	void findProcesses()
 }
 
+export async function restoreStartupBackup(): Promise<BackupResponse> {
+	return requestBackup('restore_backup', { target: 'startup' })
+}
+
 export async function respondToCommand(approved: boolean): Promise<void> {
-	if (!approved || !currentCommand) {
+	if (!approved) {
+		updateState({ phase: 'running', response: 'Restoring the soft backup...' })
+		try {
+			await requestBackup('restore_backup')
+		} catch (error) {
+			updateState({
+				phase: 'error',
+				response: '',
+				error: error instanceof Error ? error.message : 'Unable to restore the soft backup.',
+				processNumber: currentProcessIndex + 1,
+				processCount: processIds.length,
+			})
+			return
+		}
 		currentProcessIndex++
 		await loadCurrentProcess()
 		return
 	}
+	if (!currentCommand) return
 
 	const command = currentCommand
 	currentCommand = undefined
@@ -114,6 +141,13 @@ async function loadCurrentProcess(): Promise<void> {
 	try {
 		nemotron.reset()
 		const processId = processIds[currentProcessIndex]
+		updateState({
+			phase: 'loading',
+			response: 'Loading process details...',
+			processNumber: currentProcessIndex + 1,
+			processCount: processIds.length,
+		})
+		await requestBackup('create_backup')
 		const details = await requestSocket<unknown>('get_error', 'error_details', { id: processId })
 		const answer = await nemotron.ask(
 			`${agentInstructions}\n\nAdditional information for process ID ${processId}:\n` +
@@ -204,6 +238,28 @@ function requestSocket<T>(event: string, responseEvent: string, payload?: unknow
 		socket.once(responseEvent, onResponse)
 		if (payload === undefined) socket.emit(event)
 		else socket.emit(event, payload)
+	})
+}
+
+function requestBackup(
+	event: 'create_backup' | 'restore_backup',
+	payload?: { target: 'startup' | 'manual' },
+): Promise<BackupResponse> {
+	return new Promise((resolve, reject) => {
+		const timeout = window.setTimeout(() => {
+			reject(new Error(`Timed out waiting for the ${event} acknowledgement.`))
+		}, 30_000)
+
+		const acknowledge = (response: BackupResponse) => {
+			window.clearTimeout(timeout)
+			if (response?.success) {
+				resolve(response)
+				return
+			}
+			reject(new Error(response?.stderr || response?.error || response?.message || `${event} failed.`))
+		}
+		if (payload) socket.emit(event, payload, acknowledge)
+		else socket.emit(event, acknowledge)
 	})
 }
 
