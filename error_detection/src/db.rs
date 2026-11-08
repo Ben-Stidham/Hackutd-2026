@@ -84,12 +84,14 @@ pub struct ErrorDatabase {
 }
 
 impl ErrorDatabase {
-    /// Opens or creates the SQLite database at `db_path`, initializes the schema,
-    /// and purges any records from prior boots so only errors since the last power-on are kept.
+    /// Clears any existing SQLite database files (`db_path`, `-wal`, `-shm`, `-journal`)
+    /// and reinitializes a fresh database and schema at `db_path`.
     pub fn open(db_path: &Path) -> io::Result<Self> {
         if let Some(parent) = db_path.parent() {
             let _ = fs::create_dir_all(parent);
         }
+
+        clear_database_files(db_path);
 
         let path_str = db_path.to_str().ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidInput, "Database path is not valid UTF-8")
@@ -113,7 +115,6 @@ impl ErrorDatabase {
         let boot_id = current_boot_id();
         let instance = Self { db, boot_id };
         instance.init_schema()?;
-        instance.purge_previous_boots()?;
 
         // Ensure world-readable permissions so any user/UI can inspect the database
         if let Ok(meta) = fs::metadata(db_path) {
@@ -125,7 +126,7 @@ impl ErrorDatabase {
         Ok(instance)
     }
 
-    /// Opens an existing database connection for fast read queries without re-running startup migrations.
+    /// Opens an existing database connection for fast read queries without clearing or reinitializing.
     pub fn open_query(db_path: &Path) -> io::Result<Self> {
         let path_str = db_path.to_str().ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidInput, "Database path is not valid UTF-8")
@@ -159,7 +160,8 @@ impl ErrorDatabase {
             PRAGMA journal_mode=WAL;\
             PRAGMA synchronous=NORMAL;\
             PRAGMA busy_timeout=5000;\
-            CREATE TABLE IF NOT EXISTS process_errors (\
+            DROP TABLE IF EXISTS process_errors;\
+            CREATE TABLE process_errors (\
                 id INTEGER PRIMARY KEY AUTOINCREMENT,\
                 timestamp INTEGER NOT NULL,\
                 boot_id TEXT NOT NULL,\
@@ -175,38 +177,10 @@ impl ErrorDatabase {
                 stdout TEXT NOT NULL,\
                 stderr TEXT NOT NULL\
             );\
-            CREATE INDEX IF NOT EXISTS idx_process_errors_ts ON process_errors(timestamp);\
-            CREATE INDEX IF NOT EXISTS idx_process_errors_pid ON process_errors(tgid);\
+            CREATE INDEX idx_process_errors_ts ON process_errors(timestamp);\
+            CREATE INDEX idx_process_errors_pid ON process_errors(tgid);\
         ";
         self.exec_sql(sql)
-    }
-
-    fn purge_previous_boots(&self) -> io::Result<()> {
-        let sql = CString::new("DELETE FROM process_errors WHERE boot_id != ?1;").unwrap();
-        let mut stmt: *mut Sqlite3Stmt = ptr::null_mut();
-        let rc = unsafe {
-            sqlite3_prepare_v2(self.db, sql.as_ptr(), -1, &mut stmt, ptr::null_mut())
-        };
-        if rc != SQLITE_OK {
-            return Err(io::Error::other(unsafe { sqlite_error_string(self.db) }));
-        }
-
-        let c_boot = CString::new(self.boot_id.as_str()).unwrap_or_default();
-        unsafe {
-            sqlite3_bind_text(
-                stmt,
-                1,
-                c_boot.as_ptr(),
-                self.boot_id.len() as i32,
-                SQLITE_TRANSIENT,
-            );
-            let step_rc = sqlite3_step(stmt);
-            sqlite3_finalize(stmt);
-            if step_rc != SQLITE_DONE {
-                return Err(io::Error::other(sqlite_error_string(self.db)));
-            }
-        }
-        Ok(())
     }
 
     pub fn insert_error(
@@ -424,6 +398,14 @@ unsafe fn sqlite_error_string(db: *mut Sqlite3) -> String {
         "Unknown SQLite error".to_string()
     } else {
         unsafe { CStr::from_ptr(ptr).to_string_lossy().into_owned() }
+    }
+}
+
+pub fn clear_database_files(db_path: &Path) {
+    let _ = fs::remove_file(db_path);
+    let base = db_path.display();
+    for suffix in ["-wal", "-shm", "-journal"] {
+        let _ = fs::remove_file(format!("{base}{suffix}"));
     }
 }
 

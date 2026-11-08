@@ -269,7 +269,7 @@ fn cmd_status(pid_path: &Path, log_path: &Path, db_path: &Path) -> ExitCode {
 }
 
 fn cmd_logs(db_path: &Path) -> ExitCode {
-    let db = match ErrorDatabase::open(db_path) {
+    let db = match ErrorDatabase::open_query(db_path) {
         Ok(d) => d,
         Err(err) => {
             eprintln!("Failed to open database {}: {err}", db_path.display());
@@ -567,8 +567,16 @@ mod tests {
         assert_eq!(rows[0].notification_body, body);
         assert_eq!(rows[0].stdout, "hello stdout\nline 2");
         assert_eq!(rows[0].stderr, "fatal stderr\nboom");
-
         drop(db);
+
+        // Re-opening via ErrorDatabase::open (as on program start) should clear and reinitialize
+        let db_reinit = ErrorDatabase::open(&db_path).expect("should reinit sqlite db");
+        let rows_after_reinit = db_reinit
+            .recent_errors(10)
+            .expect("should query empty reinitialized db");
+        assert!(rows_after_reinit.is_empty());
+
+        drop(db_reinit);
         let _ = fs::remove_file(&db_path);
         let _ = fs::remove_file(format!("{}-wal", db_path.display()));
         let _ = fs::remove_file(format!("{}-shm", db_path.display()));
