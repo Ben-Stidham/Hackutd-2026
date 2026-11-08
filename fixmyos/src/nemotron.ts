@@ -5,6 +5,7 @@ type Message = {
 	content: string
 }
 
+const MAX_MODEL_LOADING_RETRIES = 8
 const MAX_HISTORY_MESSAGES = 4
 const MAX_HISTORY_MESSAGE_CHARS = 5000
 
@@ -51,9 +52,12 @@ export class Nemotron {
 				if (!response.ok) {
 					const details = await response.text()
 					if (response.status === 503 && /loading model/i.test(details)) {
-						const delay = Math.min(1000 * 2 ** attempt, 5000)
-						await new Promise((resolve) => setTimeout(resolve, delay))
-						continue
+						if (attempt < MAX_MODEL_LOADING_RETRIES) {
+							const delay = Math.min(1000 * 2 ** attempt, 5000)
+							await new Promise((resolve) => setTimeout(resolve, delay))
+							continue
+						}
+						throw new Error('Nemotron is still loading the model. Please try again shortly.')
 					}
 					if (response.status === 502) {
 						throw new Error(
