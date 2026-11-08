@@ -50,4 +50,5 @@ echo
 echo "Run: ./pacman-lab.sh --cleanup"
 
 sudo pacman --dbpath /tmp/pacman-troubleshooting-lab/db -Sy
+pacman --dbpath /tmp/pacman-troubleshooting-lab/db -Q
 
