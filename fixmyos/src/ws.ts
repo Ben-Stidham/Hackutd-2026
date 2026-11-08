@@ -437,6 +437,7 @@ function requestSocket<T>(event: string, responseEvent: string, payload?: unknow
 }
 
 function updateState(state: WorkflowState): void {
+	console.log(state.phase.toUpperCase(), state.response, state.processNumber ? `(${state.processNumber}/${state.processCount})` : '')
 	stateListener?.({ ...state, commandHistory: [...commandHistory] })
 }
 
