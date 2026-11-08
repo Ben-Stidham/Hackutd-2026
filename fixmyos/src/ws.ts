@@ -328,7 +328,7 @@ async function showModelStep(answer: string): Promise<void> {
 
 function extractSection(answer: string, sectionName: string): string {
 	const escapedName = sectionName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-	const heading = new RegExp(`^#{2,3}\\s+${escapedName}\\s*$`, 'im').exec(answer)
+	const heading = new RegExp(`^#{2,3}\\s+${escapedName}\\s*$`, 'im').exec(anproblemswer)
 	if (!heading) return ''
 
 	const contentStart = heading.index + heading[0].length
