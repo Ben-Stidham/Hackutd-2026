@@ -1,21 +1,10 @@
 <script setup lang="ts">
 import { onMounted, ref } from 'vue'
-import { getErrors } from '../ws'
+import { respondToCommand, startRecoveryWorkflow, type WorkflowState } from '../ws'
 
-const response = ref('')
-const requestError = ref('')
-const loading = ref(true)
-const decision = ref<'yes' | 'no' | null>(null)
+const workflow = ref<WorkflowState>({ phase: 'loading', response: 'Starting review...' })
 
-onMounted(async () => {
-	try {
-		response.value = await getErrors()
-	} catch (error) {
-		requestError.value = error instanceof Error ? error.message : 'Unable to load the analysis.'
-	} finally {
-		loading.value = false
-	}
-})
+onMounted(() => startRecoveryWorkflow((state) => (workflow.value = state)))
 </script>
 
 <template>
@@ -32,35 +21,40 @@ onMounted(async () => {
           <div class="section-kicker">01 / ANALYSIS</div>
           <h2 id="analysis-title">Nemotron response</h2>
         </div>
-        <span class="live-label"><span></span> LIVE OUTPUT</span>
+        <span v-if="workflow.processNumber" class="live-label">
+          <span></span> PROCESS {{ workflow.processNumber }} OF {{ workflow.processCount }}
+        </span>
+        <span v-else class="live-label"><span></span> {{ workflow.phase === 'complete' ? 'REVIEW COMPLETE' : 'LIVE OUTPUT' }}</span>
       </div>
 
-      <div class="response-box" :class="{ 'response-box--error': requestError }" aria-live="polite">
+      <div class="response-box" :class="{ 'response-box--error': workflow.phase === 'error' }" aria-live="polite">
         <div class="response-gutter" aria-hidden="true"><span>AI</span></div>
         <div class="response-content">
-          <p v-if="loading" class="placeholder"><span class="loading-dot"></span> Waiting for system report...</p>
-          <p v-else-if="requestError" class="error-message">{{ requestError }}</p>
-          <p v-else-if="response" class="response-text">{{ response }}</p>
+          <p v-if="workflow.phase === 'loading' || workflow.phase === 'running'" class="placeholder"><span class="loading-dot"></span> {{ workflow.response }}</p>
+          <p v-else-if="workflow.phase === 'error'" class="error-message">{{ workflow.error }}</p>
+          <p v-else-if="workflow.response" class="response-text">{{ workflow.response }}</p>
           <p v-else class="placeholder">No response was returned.</p>
         </div>
       </div>
+
+      <div v-if="workflow.phase === 'approval' && workflow.command" class="command-preview">
+        <span class="command-label">NEXT COMMAND</span>
+        <code>{{ workflow.command }}</code>
+      </div>
     </section>
 
-    <section class="approval-panel" aria-labelledby="approval-title">
+    <section v-if="workflow.phase === 'approval'" class="approval-panel" aria-labelledby="approval-title">
       <div class="approval-icon" aria-hidden="true">?</div>
       <div class="approval-copy">
         <div class="section-kicker">02 / YOUR DECISION</div>
         <h2 id="approval-title">Would you like to run the next command?</h2>
-        <p>Review the suggested steps above before making a choice.</p>
-        <p v-if="decision" class="decision-status" role="status">
-          {{ decision === 'yes' ? 'Yes selected.' : 'No selected.' }}
-        </p>
+        <p>Review the proposed command before approving it.</p>
       </div>
       <div class="approval-actions">
-        <button class="choice-button choice-button--yes" type="button" :disabled="loading || !!requestError" :aria-pressed="decision === 'yes'" @click="decision = 'yes'">
+        <button class="choice-button choice-button--yes" type="button" @click="respondToCommand(true)">
           Yes <span aria-hidden="true">&#8594;</span>
         </button>
-        <button class="choice-button choice-button--no" type="button" :disabled="loading || !!requestError" :aria-pressed="decision === 'no'" @click="decision = 'no'">
+        <button class="choice-button choice-button--no" type="button" @click="respondToCommand(false)">
           No
         </button>
       </div>
@@ -211,6 +205,28 @@ h1 span {
   overflow-wrap: anywhere;
 }
 
+.command-preview {
+  display: grid;
+  gap: 8px;
+  margin-top: 12px;
+  padding: 14px 18px;
+  border-left: 3px solid #8da447;
+  background: #e9eee6;
+}
+
+.command-label {
+  color: #758171;
+  font: 650 9px/1.2 ui-monospace, monospace;
+  letter-spacing: 0.1em;
+}
+
+.command-preview code {
+  color: #27382c;
+  font: 13px/1.6 ui-monospace, 'SFMono-Regular', Consolas, monospace;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
 .placeholder {
   display: flex;
   align-items: center;
@@ -264,13 +280,6 @@ h1 span {
 .approval-copy > p:not(.decision-status) {
   color: #6a796f;
   font-size: 13px;
-}
-
-.decision-status {
-  margin-top: 8px;
-  color: #4b704e;
-  font-size: 12px;
-  font-weight: 650;
 }
 
 .approval-actions {

@@ -6,6 +6,8 @@ type Message = {
 }
 
 const MAX_MODEL_LOADING_RETRIES = 8
+const MAX_HISTORY_MESSAGES = 4
+const MAX_HISTORY_MESSAGE_CHARS = 5000
 
 export class Nemotron {
 	private history: Message[] = [
@@ -16,7 +18,22 @@ export class Nemotron {
 	]
 
 	async ask(question: string): Promise<string> {
-		this.history.push({ role: 'user', content: question })
+		const systemMessage = this.history[0] ?? {
+			role: 'system' as const,
+			content: 'You are a helpful assistant.',
+		}
+		const recentHistory = this.history
+			.slice(1)
+			.slice(-(MAX_HISTORY_MESSAGES - 1))
+			.map((message) => ({
+				...message,
+				content: message.content.slice(0, MAX_HISTORY_MESSAGE_CHARS),
+			}))
+		this.history = [
+			systemMessage,
+			...recentHistory,
+			{ role: 'user', content: question.slice(0, MAX_HISTORY_MESSAGE_CHARS) },
+		]
 
 		try {
 			for (let attempt = 0; ; attempt++) {
