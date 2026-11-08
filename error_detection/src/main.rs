@@ -567,6 +567,36 @@ mod tests {
         assert_eq!(rows[0].notification_body, body);
         assert_eq!(rows[0].stdout, "hello stdout\nline 2");
         assert_eq!(rows[0].stderr, "fatal stderr\nboom");
+
+        // Inserting another error for the same process ('crashy') and same exit_code (13)
+        // should overwrite with the most recent occurrence instead of adding a duplicate row
+        let newer_ev = ProcessExitEvent {
+            pid: 8888,
+            tgid: 8888,
+            cmdline: "crashy --again".to_string(),
+            ..ev.clone()
+        };
+        let (newer_summary, newer_body) = format_exit_details(&newer_ev);
+        db.insert_error(&newer_ev, &newer_summary, &newer_body, "newer stdout", "newer stderr")
+            .expect("should upsert most recent error record");
+
+        let rows_after_upsert = db.recent_errors(10).expect("should query upserted errors");
+        assert_eq!(rows_after_upsert.len(), 1);
+        assert_eq!(rows_after_upsert[0].tgid, 8888);
+        assert_eq!(rows_after_upsert[0].cmdline, "crashy --again");
+        assert_eq!(rows_after_upsert[0].stdout, "newer stdout");
+        assert_eq!(rows_after_upsert[0].stderr, "newer stderr");
+
+        // A different exit_code for the same process name is stored as its own entry
+        let diff_code_ev = ProcessExitEvent {
+            exit_code: 2,
+            ..newer_ev
+        };
+        let (diff_summary, diff_body) = format_exit_details(&diff_code_ev);
+        db.insert_error(&diff_code_ev, &diff_summary, &diff_body, "code 2 out", "code 2 err")
+            .expect("should insert distinct exit_code");
+        assert_eq!(db.recent_errors(10).unwrap().len(), 2);
+
         drop(db);
 
         // Re-opening via ErrorDatabase::open (as on program start) should clear and reinitialize
