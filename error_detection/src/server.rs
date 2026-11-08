@@ -20,6 +20,7 @@ use crate::db::{ErrorDatabase, ErrorLogRecord};
 #[derive(Debug, Clone, Serialize)]
 pub struct ErrorSummaryItem {
     pub id: i64,
+    pub pid: i32,
     pub process_name: String,
     pub comm: String,
     pub error_code: i32,
@@ -30,6 +31,7 @@ impl From<&ErrorLogRecord> for ErrorSummaryItem {
     fn from(r: &ErrorLogRecord) -> Self {
         Self {
             id: r.id,
+            pid: r.pid,
             process_name: r.comm.clone(),
             comm: r.comm.clone(),
             error_code: r.exit_code,
@@ -468,6 +470,7 @@ mod tests {
         let arr = list_val.as_array().expect("should return JSON array");
         assert_eq!(arr.len(), 1);
         assert_eq!(arr[0]["id"], 1);
+        assert_eq!(arr[0]["pid"], 9001);
         assert_eq!(arr[0]["process_name"], "broken_worker");
         assert_eq!(arr[0]["error_code"], 127);
 

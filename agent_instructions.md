@@ -9,6 +9,7 @@ The format of these will be as follows:
 [
   {
     "id": 1,
+    "pid": 9001,
     "process_name": "broken_worker",
     "comm": "broken_worker",
     "error_code": 127,
@@ -46,8 +47,6 @@ Additional information will be returned in the format of:
 ## Fixing:
 
 For each process that is functioning incorrectly, analyze why it is and determine a plan on how to fix it  
-You may only request the most recent ID for a given process name, for a given error code  
-This is to reduce the number of required calls  
 Do not create a plan to fix until you have further investigated the error, if it is even necessary to fix  
 Upon creating the plan, return to the user a description of the error, and a list of separate commands on how to fix it  
 You are currently being ran as a system daemon. You cannot change directory, so all of your paths should be absolute  

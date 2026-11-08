@@ -176,7 +176,7 @@ impl ErrorDatabase {
                 notification_body TEXT NOT NULL,\
                 stdout TEXT NOT NULL,\
                 stderr TEXT NOT NULL,\
-                UNIQUE(comm, exit_code)\
+                UNIQUE(pid, exit_code)\
             );\
             CREATE INDEX idx_process_errors_ts ON process_errors(timestamp);\
             CREATE INDEX idx_process_errors_pid ON process_errors(tgid);\
@@ -196,12 +196,12 @@ impl ErrorDatabase {
             "INSERT INTO process_errors \
              (timestamp, boot_id, pid, tgid, parent_pid, comm, cmdline, exit_code, exit_signal, summary, notification_body, stdout, stderr) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13) \
-             ON CONFLICT(comm, exit_code) DO UPDATE SET \
+             ON CONFLICT(pid, exit_code) DO UPDATE SET \
                  timestamp = excluded.timestamp, \
                  boot_id = excluded.boot_id, \
-                 pid = excluded.pid, \
                  tgid = excluded.tgid, \
                  parent_pid = excluded.parent_pid, \
+                 comm = excluded.comm, \
                  cmdline = excluded.cmdline, \
                  exit_signal = excluded.exit_signal, \
                  summary = excluded.summary, \
