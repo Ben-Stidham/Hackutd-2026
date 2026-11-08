@@ -17,9 +17,9 @@ The format of these will be as follows:
 ]
 ```
 
-Determine which of them could be due to the system not functioning correctly  
-Return a list of IDs for which you'd like more information about. You would like more information about all processes in the list  
-This should just be a list of the ids specified above  
+Do not attempt to determine which processes are broken or whether a fix is required at this initial stage.
+Return a list of IDs for which you'd like more information about. The returned list must be the duplicate of the IDs of the first list (i.e. every ID in the input list must be included in process_list).
+Only after receiving more information on a given call should you determine if a fix is required.
 Additional information will be returned in the format of:
 
 ```
@@ -65,9 +65,8 @@ Initial return:
 
 ```
 process_list: <p_list>
-(This should only be for the processes that you wish to get more information above)
-(Reference the Fixing section for more information on what that should look like)
-(It should be formatted like a js array of strings)
+(This should be the duplicate of all IDs from the input list)
+(It should be formatted like a js array of strings, e.g. ["1", "2"])
 ```
 
 After getting more information on a given call:
