@@ -395,7 +395,7 @@ function requestSocket<T>(event: string, responseEvent: string, payload?: unknow
 		const timeout = window.setTimeout(() => {
 			socket.off(responseEvent, onResponse)
 			reject(new Error(`Timed out waiting for the ${responseEvent} Socket.IO message.`))
-		}, 30_000)
+		}, 120_000)
 
 		const onResponse = (response: T) => {
 			window.clearTimeout(timeout)
@@ -415,7 +415,7 @@ function requestBackup(
 	return new Promise((resolve, reject) => {
 		const timeout = window.setTimeout(() => {
 			reject(new Error(`Timed out waiting for the ${event} acknowledgement.`))
-		}, 30_000)
+		}, 120_000)
 
 		const acknowledge = (response: BackupResponse) => {
 			window.clearTimeout(timeout)
