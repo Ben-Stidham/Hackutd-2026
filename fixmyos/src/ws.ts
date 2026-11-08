@@ -49,6 +49,8 @@ const socket = io(import.meta.env.VITE_SOCKET_URL || window.location.origin, {
 	autoConnect: !developmentMockMode,
 })
 
+const MAX_FORMAT_REPHRASE_ATTEMPTS = 2
+
 let stateListener: StateListener | undefined
 let processIds: string[] = []
 let currentProcessIndex = 0
@@ -139,6 +141,7 @@ export async function respondToCommand(approved: boolean): Promise<void> {
 			return
 		}
 		currentProcessIndex++
+		commandHistory = []
 		await loadCurrentProcess()
 		return
 	}
@@ -201,6 +204,7 @@ async function respondToMockCommand(approved: boolean): Promise<void> {
 	if (mockCommandIndex >= process.commands.length) {
 		mockProcessIndex++
 		mockCommandIndex = 0
+		commandHistory = []
 	}
 	showMockStep()
 }
@@ -306,13 +310,32 @@ async function loadCurrentProcess(): Promise<void> {
 }
 
 async function showModelStep(answer: string): Promise<void> {
-	const next = getNextCommand(answer)
+	let next = getNextCommand(answer)
+	for (let attempt = 0; next.kind === 'missing' && attempt < MAX_FORMAT_REPHRASE_ATTEMPTS; attempt++) {
+		updateState({
+			phase: 'running',
+			response: 'Asking Nemotron to rephrase its response...',
+			processNumber: currentProcessIndex + 1,
+			processCount: processIds.length,
+		})
+		answer = await nemotron.ask(
+			'Your previous response did not follow the required output format. Rephrase it without changing its analysis or recommendation, and do not invent a new command. Return only one of these formats:\n' +
+				'For another action: a short `### Situation` section, followed by exactly one shell command on a line beginning with `## `. Do not include any later commands.\n' +
+				'When no more action is required: end with the exact text `FIX COMPLETE` on its own line.\n' +
+				'Do not put the command heading in a code fence.\n\nPrevious response:\n' +
+				answer,
+		)
+		next = getNextCommand(answer)
+	}
+
 	if (next.kind === 'done') {
 		currentProcessIndex++
+		commandHistory = []
 		await loadCurrentProcess()
 		return
 	}
 	if (next.kind === 'missing') {
+		commandHistory = []
 		updateState({
 			phase: 'error',
 			response: answer,
