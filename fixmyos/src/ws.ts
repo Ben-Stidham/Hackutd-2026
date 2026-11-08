@@ -31,15 +31,6 @@ type MockProcess = {
 	commands: string[]
 }
 
-type BackupResponse = {
-	success?: boolean
-	snapshot_name?: string
-	stdout?: string
-	stderr?: string
-	error?: string
-	message?: string
-}
-
 const nemotron = new Nemotron()
 export const developmentMockMode =
 	import.meta.env.DEV && new URLSearchParams(window.location.search).get('mock-ai') === '1'
@@ -108,18 +99,6 @@ export function startMockRecoveryWorkflow(onState: StateListener): void {
 	showMockStep()
 }
 
-export async function restoreStartupBackup(): Promise<BackupResponse> {
-	if (mockMode) {
-		return {
-			success: true,
-			snapshot_name: 'development_mock',
-			stdout: 'Development preview only. No volume was restored.',
-			stderr: '',
-		}
-	}
-	return requestBackup('restore_backup', { target: 'startup' })
-}
-
 export async function respondToCommand(approved: boolean): Promise<void> {
 	if (mockMode) {
 		await respondToMockCommand(approved)
@@ -127,19 +106,7 @@ export async function respondToCommand(approved: boolean): Promise<void> {
 	}
 
 	if (!approved) {
-		updateState({ phase: 'running', response: 'Restoring the soft backup...' })
-		try {
-			await requestBackup('restore_backup')
-		} catch (error) {
-			updateState({
-				phase: 'error',
-				response: '',
-				error: error instanceof Error ? error.message : 'Unable to restore the soft backup.',
-				processNumber: currentProcessIndex + 1,
-				processCount: processIds.length,
-			})
-			return
-		}
+		updateState({ phase: 'running', response: 'Skipping this process...' })
 		currentProcessIndex++
 		commandHistory = []
 		await loadCurrentProcess()
@@ -182,7 +149,7 @@ async function respondToMockCommand(approved: boolean): Promise<void> {
 		phase: 'running',
 		response: approved
 			? `Simulating command ${mockCommandIndex + 1} of ${process.commands.length}. No command was executed.`
-			: 'Simulating soft restore. No volume was changed.',
+			: 'Skipping this process. No command was executed.',
 		processNumber: mockProcessIndex + 1,
 		processCount: mockProcesses.length,
 		command: approved ? command : undefined,
@@ -287,7 +254,6 @@ async function loadCurrentProcess(): Promise<void> {
 			processNumber: currentProcessIndex + 1,
 			processCount: processIds.length,
 		})
-		await requestBackup('create_backup')
 		const details = await requestSocket<unknown>('get_error', 'error_details', { id: processId })
 		const answer = await nemotron.ask(
 			`${agentInstructions}\n\nAdditional information for process ID ${processId}:\n` +
@@ -430,28 +396,6 @@ function requestSocket<T>(event: string, responseEvent: string, payload?: unknow
 		socket.once(responseEvent, onResponse)
 		if (payload === undefined) socket.emit(event)
 		else socket.emit(event, payload)
-	})
-}
-
-function requestBackup(
-	event: 'create_backup' | 'restore_backup',
-	payload?: { target: 'startup' | 'manual' },
-): Promise<BackupResponse> {
-	return new Promise((resolve, reject) => {
-		const timeout = window.setTimeout(() => {
-			reject(new Error(`Timed out waiting for the ${event} acknowledgement.`))
-		}, 120_000)
-
-		const acknowledge = (response: BackupResponse) => {
-			window.clearTimeout(timeout)
-			if (response?.success) {
-				resolve(response)
-				return
-			}
-			reject(new Error(response?.stderr || response?.error || response?.message || `${event} failed.`))
-		}
-		if (payload) socket.emit(event, payload, acknowledge)
-		else socket.emit(event, acknowledge)
 	})
 }
 
