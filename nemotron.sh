@@ -126,7 +126,28 @@ echo "=========================================="
 echo "Nemotron API: http://localhost:$PORT"
 echo "=========================================="
 
-brev port-forward "$INSTANCE" --port "$PORT:$PORT"
+# ==========================================
+# Direct SSH port forwarding
+# ==========================================
 
+info "Starting direct SSH tunnel"
 
+LOCAL_PORT="$PORT"
 
+# Check whether local port is already occupied
+if ss -ltn | grep -qE "127\.0\.0\.1:${LOCAL_PORT}[[:space:]]|0\.0\.0\.0:${LOCAL_PORT}[[:space:]]"; then
+    error "Local port $LOCAL_PORT is already occupied."
+fi
+
+echo "Nemotron API: http://localhost:$LOCAL_PORT"
+echo "Remote:       $INSTANCE:$PORT"
+echo
+echo "Starting SSH tunnel..."
+echo "Press Ctrl+C to disconnect."
+
+ssh -N \
+    -o ExitOnForwardFailure=yes \
+    -o ServerAliveInterval=30 \
+    -o ServerAliveCountMax=3 \
+    -L "127.0.0.1:${LOCAL_PORT}:127.0.0.1:${PORT}" \
+    "$INSTANCE"
