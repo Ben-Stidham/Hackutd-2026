@@ -1,8 +1,10 @@
 <script setup lang="ts">
 import { nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import {
+  developmentMockMode,
   respondToCommand,
   restoreStartupBackup,
+  startMockRecoveryWorkflow,
   startRecoveryWorkflow,
   type WorkflowState,
 } from '../ws'
@@ -49,18 +51,23 @@ watch(
   { flush: 'post' },
 )
 
-onMounted(() =>
-  startRecoveryWorkflow((state) => {
+onMounted(() => {
+  const onState = (state: WorkflowState) => {
     workflow.value = state
     if (state.planItems) latestPlan.value = state.planItems
-  }),
-)
+  }
+
+  if (developmentMockMode) startMockRecoveryWorkflow(onState)
+  else startRecoveryWorkflow(onState)
+})
 onBeforeUnmount(() => responseResizeObserver?.disconnect())
 
 async function restoreHardBackup(): Promise<void> {
   if (
     !window.confirm(
-      'DESTRUCTIVE SYSTEM ROLLBACK\n\nThis restores the origin volume to the daemon-startup snapshot, overwriting changes made since then. The LVM merge consumes the startup snapshot. Continue?',
+      developmentMockMode
+        ? 'DEVELOPMENT MOCK ONLY\n\nThis action is simulated. No volume will be restored. Continue?'
+        : 'DESTRUCTIVE SYSTEM ROLLBACK\n\nThis restores the origin volume to the daemon-startup snapshot, overwriting changes made since then. The LVM merge consumes the startup snapshot. Continue?',
     )
   ) {
     return
@@ -83,7 +90,7 @@ async function restoreHardBackup(): Promise<void> {
   <main class="workspace" :class="`workflow--${workflow.phase}`">
     <section class="intro" aria-labelledby="page-title">
       <h1 id="page-title">System recovery <span>Trace the failure. Approve the next step.</span></h1>
-      <span class="session-code">LOCAL MACHINE</span>
+      <span class="session-code">{{ developmentMockMode ? 'DEV MOCK / NO COMMANDS EXECUTED' : 'LOCAL MACHINE' }}</span>
     </section>
 
     <div class="console-grid">
@@ -841,7 +848,11 @@ h1 span {
 
 .workspace {
   width: min(100% - 16px, 1360px);
+  min-height: 100svh;
+  display: flex;
+  flex-direction: column;
   padding-top: clamp(8px, 1.5vh, 14px);
+  padding-bottom: 8px;
 }
 
 .intro {
@@ -875,9 +886,11 @@ h1 span {
 }
 
 .console-grid {
+  flex: 1;
   display: grid;
   grid-template-columns: minmax(0, 1.15fr) minmax(340px, 0.85fr);
-  align-items: start;
+  align-items: stretch;
+  min-height: max(430px, calc(100svh - 190px));
   gap: 6px;
 }
 
@@ -892,12 +905,19 @@ h1 span {
 }
 
 .context-panel {
+  display: flex;
+  flex-direction: column;
   padding: 8px 9px 9px;
 }
 
 .action-panel {
   position: sticky;
   top: 18px;
+  align-self: center;
+  width: 100%;
+  min-height: clamp(260px, 40svh, 420px);
+  display: flex;
+  flex-direction: column;
   padding: 8px;
   animation-delay: 80ms;
 }
@@ -935,7 +955,8 @@ h1 span {
 }
 
 .situation-block {
-  padding: 7px 0 8px;
+  min-height: clamp(190px, 27svh, 290px);
+  padding: 14px 0 18px;
 }
 
 .block-label {
@@ -951,8 +972,8 @@ h1 span {
   overflow: hidden;
   margin: 0;
   color: #d3ddd4;
-  font-size: 13px;
-  line-height: 1.75;
+  font-size: 14px;
+  line-height: 1.7;
   white-space: pre-wrap;
   overflow-wrap: anywhere;
 }
@@ -972,6 +993,8 @@ h1 span {
 }
 
 .plan-block {
+  flex: 1;
+  margin-top: auto;
   padding-top: 7px;
   border-top: 1px solid #303a32;
 }
@@ -1003,15 +1026,15 @@ h1 span {
   padding: 7px 0;
   border-top: 1px solid #272f29;
   color: #d5ded5;
-  font-size: 12px;
-  line-height: 1.6;
+  font-size: 14px;
+  line-height: 1.65;
   overflow-wrap: anywhere;
   animation: rise-in 300ms ease-out both;
 }
 
 .plan-index {
   color: #dcff68;
-  font: 600 10px/1.7 ui-monospace, 'SFMono-Regular', Consolas, monospace;
+  font: 600 11px/1.7 ui-monospace, 'SFMono-Regular', Consolas, monospace;
 }
 
 .plan-empty {
@@ -1039,9 +1062,10 @@ h1 span {
 }
 
 .command-block {
+  flex: 1 1 auto;
   display: grid;
   gap: 7px;
-  min-height: 80px;
+  min-height: 120px;
   align-content: start;
   margin-top: 8px;
   padding: 9px;
@@ -1076,7 +1100,7 @@ h1 span {
 .approval-controls {
   display: grid;
   gap: 7px;
-  margin-top: 8px;
+  margin-top: auto;
   padding-top: 8px;
   border-top: 1px solid #303a32;
 }
@@ -1124,7 +1148,8 @@ h1 span {
 .action-note {
   display: flex;
   gap: 5px;
-  margin-top: 8px;
+  margin-top: 16px;
+  padding-top: 8px;
   color: #7f8b82;
   font-size: 11px;
   line-height: 1.5;
@@ -1142,7 +1167,9 @@ h1 span {
 @media (max-width: 760px) {
   .workspace {
     width: min(100% - 12px, 720px);
+    min-height: 100svh;
     padding-top: 8px;
+    padding-bottom: 8px;
   }
 
   .intro {
@@ -1163,11 +1190,35 @@ h1 span {
   }
 
   .console-grid {
+    flex: initial;
     grid-template-columns: minmax(0, 1fr);
+    min-height: 0;
+    gap: 6px;
+  }
+
+  .context-panel {
+    min-height: 0;
+  }
+
+  .situation-block {
+    min-height: 0;
+    padding: 12px 0 14px;
   }
 
   .action-panel {
     position: static;
+    align-self: stretch;
+    min-height: 0;
+  }
+
+  .command-block {
+    flex: initial;
+    min-height: 110px;
+  }
+
+  .approval-controls,
+  .action-note {
+    margin-top: 8px;
   }
 }
 
