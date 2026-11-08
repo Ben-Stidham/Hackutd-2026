@@ -31,8 +31,8 @@ ${SUDO} install -m 0644 "${SERVICE_SRC}" "${SERVICE_DEST}"
 echo "==> Reloading systemd daemon..."
 ${SUDO} systemctl daemon-reload
 
-echo "==> Starting ${SERVICE_NAME} (without enabling on boot)..."
-${SUDO} systemctl start "${SERVICE_NAME}"
+echo "==> Starting ${SERVICE_NAME} (and enabling on boot)..."
+${SUDO} systemctl enable --now "${SERVICE_NAME}"
 
 echo "==> Service status:"
 ${SUDO} systemctl status "${SERVICE_NAME}" --no-pager

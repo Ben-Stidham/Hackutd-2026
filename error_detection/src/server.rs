@@ -10,9 +10,10 @@ use axum::Router;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use socketioxide::SocketIo;
-use socketioxide::extract::{AckSender, Data, SocketRef};
+use socketioxide::extract::{AckSender, Data, SocketRef, TryData};
 use tower_http::cors::CorsLayer;
 
+use crate::backup::BackupManager;
 use crate::daemon::{is_shutdown_requested, log_message};
 use crate::db::{ErrorDatabase, ErrorLogRecord};
 
@@ -95,7 +96,11 @@ pub struct SocketIoServerHandle {
 }
 
 impl SocketIoServerHandle {
-    pub fn start(port: u16, db_path: PathBuf) -> io::Result<Self> {
+    pub fn start(
+        port: u16,
+        db_path: PathBuf,
+        backup_manager: Arc<BackupManager>,
+    ) -> io::Result<Self> {
         let bind_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
         let std_listener = std::net::TcpListener::bind(bind_addr)?;
         std_listener.set_nonblocking(true)?;
@@ -108,9 +113,7 @@ impl SocketIoServerHandle {
             {
                 Ok(rt) => rt,
                 Err(err) => {
-                    log_message(&format!(
-                        "Failed to build Tokio runtime for Socket.IO: {err}"
-                    ));
+                    log_message(&format!("Failed to build Tokio runtime for Socket.IO: {err}"));
                     return;
                 }
             };
@@ -121,7 +124,7 @@ impl SocketIoServerHandle {
                     return;
                 };
 
-                let app = build_socket_io_router(Arc::new(db_path));
+                let app = build_socket_io_router(Arc::new(db_path), backup_manager);
 
                 let server = axum::serve(listener, app).with_graceful_shutdown(async {
                     while !is_shutdown_requested() {
@@ -150,18 +153,36 @@ impl Drop for SocketIoServerHandle {
     }
 }
 
-pub fn build_socket_io_router(db_path: Arc<PathBuf>) -> Router {
+pub fn build_socket_io_router(
+    db_path: Arc<PathBuf>,
+    backup_manager: Arc<BackupManager>,
+) -> Router {
     let (layer, io) = SocketIo::new_layer();
 
     io.ns("/", move |socket: SocketRef| {
         let db_for_list = Arc::clone(&db_path);
         let db_for_list_alias = Arc::clone(&db_path);
+        let db_for_get_errors = Arc::clone(&db_path);
         let db_for_get = Arc::clone(&db_path);
         let db_for_get_alias = Arc::clone(&db_path);
 
+        let bm_for_create = Arc::clone(&backup_manager);
+        let bm_for_create_alias = Arc::clone(&backup_manager);
+        let bm_for_restore = Arc::clone(&backup_manager);
+        let bm_for_restore_alias = Arc::clone(&backup_manager);
+
         // 1. List all failed processes (only when prompted by the client)
-        socket.on("get_errors", move |s: SocketRef, ack: AckSender| {
+        socket.on("list_errors", move |s: SocketRef, ack: AckSender| {
             let db_path = Arc::clone(&db_for_list);
+            async move {
+                let payload = query_error_list(&db_path);
+                let _ = ack.send(&payload);
+                let _ = s.emit("errors_list", &payload);
+            }
+        });
+
+        socket.on("get_errors", move |s: SocketRef, ack: AckSender| {
+            let db_path = Arc::clone(&db_for_get_errors);
             async move {
                 let payload = query_error_list(&db_path);
                 let _ = ack.send(&payload);
@@ -221,9 +242,94 @@ pub fn build_socket_io_router(db_path: Arc<PathBuf>) -> Router {
                 let _ = s.emit("command_result", &payload);
             },
         );
+
+        // 4. Create an LVM snapshot backup (overwriting the previous server-triggered backup)
+        socket.on("create_backup", move |s: SocketRef, ack: AckSender| {
+            let bm = Arc::clone(&bm_for_create);
+            async move {
+                let payload = handle_create_backup(bm).await;
+                let _ = ack.send(&payload);
+                let _ = s.emit("backup_result", &payload);
+            }
+        });
+
+        socket.on("backup", move |s: SocketRef, ack: AckSender| {
+            let bm = Arc::clone(&bm_for_create_alias);
+            async move {
+                let payload = handle_create_backup(bm).await;
+                let _ = ack.send(&payload);
+                let _ = s.emit("backup_result", &payload);
+            }
+        });
+
+        // 5. Restore an LVM snapshot backup (defaults to most recent unless specified)
+        socket.on(
+            "restore_backup",
+            move |s: SocketRef, TryData::<Value>(maybe_data), ack: AckSender| {
+                let bm = Arc::clone(&bm_for_restore);
+                async move {
+                    let target = maybe_data.ok().and_then(|v| extract_restore_target(&v));
+                    let payload = handle_restore_backup(bm, target).await;
+                    let _ = ack.send(&payload);
+                    let _ = s.emit("restore_result", &payload);
+                }
+            },
+        );
+
+        socket.on(
+            "restore",
+            move |s: SocketRef, TryData::<Value>(maybe_data), ack: AckSender| {
+                let bm = Arc::clone(&bm_for_restore_alias);
+                async move {
+                    let target = maybe_data.ok().and_then(|v| extract_restore_target(&v));
+                    let payload = handle_restore_backup(bm, target).await;
+                    let _ = ack.send(&payload);
+                    let _ = s.emit("restore_result", &payload);
+                }
+            },
+        );
     });
 
     Router::new().layer(layer).layer(CorsLayer::permissive())
+}
+
+pub async fn handle_create_backup(bm: Arc<BackupManager>) -> Value {
+    match tokio::task::spawn_blocking(move || bm.create_manual_backup()).await {
+        Ok(res) => serde_json::to_value(res).unwrap_or(Value::Null),
+        Err(err) => json!({
+            "success": false,
+            "action": "create_backup",
+            "stderr": format!("Task join error: {err}")
+        }),
+    }
+}
+
+pub async fn handle_restore_backup(bm: Arc<BackupManager>, target: Option<String>) -> Value {
+    match tokio::task::spawn_blocking(move || bm.restore_backup(target.as_deref())).await {
+        Ok(res) => serde_json::to_value(res).unwrap_or(Value::Null),
+        Err(err) => json!({
+            "success": false,
+            "action": "restore_backup",
+            "stderr": format!("Task join error: {err}")
+        }),
+    }
+}
+
+pub fn extract_restore_target(val: &Value) -> Option<String> {
+    match val {
+        Value::String(s) if !s.trim().is_empty() => Some(s.trim().to_string()),
+        Value::Object(map) => {
+            for key in ["target", "slot", "backup", "type", "name"] {
+                if let Some(Value::String(s)) = map.get(key) {
+                    if !s.trim().is_empty() {
+                        return Some(s.trim().to_string());
+                    }
+                }
+            }
+            None
+        }
+        _ => None,
+    }
 }
 
 pub fn query_error_list(db_path: &Path) -> Value {
@@ -452,5 +558,22 @@ mod tests {
         assert_eq!(res.error_code, 3);
         assert_eq!(res.stdout, "out_msg");
         assert_eq!(res.stderr, "err_msg");
+    }
+
+    #[test]
+    fn test_extract_restore_target() {
+        assert_eq!(
+            extract_restore_target(&json!("startup")),
+            Some("startup".to_string())
+        );
+        assert_eq!(
+            extract_restore_target(&json!({"target": "manual"})),
+            Some("manual".to_string())
+        );
+        assert_eq!(
+            extract_restore_target(&json!({"slot": "startup"})),
+            Some("startup".to_string())
+        );
+        assert_eq!(extract_restore_target(&json!({})), None);
     }
 }

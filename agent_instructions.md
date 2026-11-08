@@ -82,4 +82,5 @@ For each further command:
 ```
 
 If at any point, you are told `COMMAND NOT APPROVED`, cease all further commands **For that pid**  
-You may then switch to a new PID to attempt to analyze and potentially fix
+You may then switch to a new PID to attempt to analyze and potentially fix  
+Upon finishing the attempted fix for a given PID, return `FIX COMPLETE`  
