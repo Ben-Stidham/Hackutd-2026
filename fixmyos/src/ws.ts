@@ -209,14 +209,17 @@ function showMockStep(): void {
 
 async function findProcesses(): Promise<void> {
 	updateState({ phase: 'loading', response: 'Checking reported process errors...' })
-
+	console.log("Starting process discovery...")
 	try {
 		const summary = await requestSocket<unknown>('get_errors', 'errors_list')
+		console.log("Process discovery complete. Summary:", summary)
 		const answer = await nemotron.ask(
 			`${agentInstructions}\n\nInitial process list:\n${promptJson(summary)}\n\n` +
 				'Return the requested process IDs exactly as process_list: ["id", ...]. Do not display or explain the IDs.',
 		)
+		console.log("Nemotron response for process IDs:", answer)
 		processIds = parseProcessIds(answer)
+		console.log("Parsed process IDs:", processIds)
 		if (processIds.length === 0) {
 			updateState({ phase: 'complete', response: 'No processes need investigation.' })
 			return
@@ -232,6 +235,7 @@ async function findProcesses(): Promise<void> {
 }
 
 async function loadCurrentProcess(): Promise<void> {
+	console.log("Loading process index:", currentProcessIndex, "of", processIds.length)
 	currentCommand = undefined
 	if (currentProcessIndex >= processIds.length) {
 		updateState({ phase: 'complete', response: 'All selected processes have been reviewed.' })
