@@ -3,6 +3,7 @@ import { computed, onMounted, ref } from 'vue'
 import {
   developmentMockMode,
   respondToCommand,
+  restoreStartupBackup,
   startMockRecoveryWorkflow,
   startRecoveryWorkflow,
   type WorkflowState,
@@ -42,6 +43,9 @@ const queueLitSegmentDash = computed(() => {
     index < litSegments ? `${segmentLength} ${segmentGap}` : `0 ${segmentUnit}`,
   ).join(' ')
 })
+const restoreBusy = ref(false)
+const restoreMessage = ref('')
+
 onMounted(() => {
   const onState = (state: WorkflowState) => {
     workflow.value = state
@@ -53,6 +57,26 @@ onMounted(() => {
   if (developmentMockMode) startMockRecoveryWorkflow(onState)
   else startRecoveryWorkflow(onState)
 })
+
+async function restoreSystemSnapshot(): Promise<void> {
+  const confirmed = window.confirm(
+    developmentMockMode
+      ? 'DEVELOPMENT MOCK ONLY\n\nNo system files will be restored. Continue?'
+      : 'DANGEROUS SYSTEM RESTORE\n\nThis overwrites system files with the daemon-startup snapshot, removing changes made since then. Continue?',
+  )
+  if (!confirmed) return
+
+  restoreBusy.value = true
+  restoreMessage.value = 'Restoring the startup snapshot...'
+  try {
+    const result = await restoreStartupBackup()
+    restoreMessage.value = result.stdout || 'Startup snapshot restore completed.'
+  } catch (error) {
+    restoreMessage.value = error instanceof Error ? error.message : 'Unable to restore the startup snapshot.'
+  } finally {
+    restoreBusy.value = false
+  }
+}
 
 </script>
 
@@ -223,6 +247,19 @@ onMounted(() => {
       <span>FIX MY OS <span class="footer-separator">/</span> REVIEW CONSOLE</span>
       <div class="footer-actions">
         <span class="footer-location">LOCAL MACHINE</span>
+        <div class="restore-control">
+          <span class="restore-warning">DESTRUCTIVE ACTION / SYSTEM ROLLBACK</span>
+          <button
+            class="restore-button"
+            type="button"
+            :disabled="restoreBusy || workflow.phase === 'loading' || workflow.phase === 'running'"
+            @click="restoreSystemSnapshot"
+          >
+            <span class="warning-mark" aria-hidden="true">!</span>
+            Restore startup snapshot
+          </button>
+          <p v-if="restoreMessage" class="restore-message" role="status">{{ restoreMessage }}</p>
+        </div>
       </div>
     </footer>
   </main>
@@ -293,6 +330,66 @@ h1 span {
   margin-top: 0;
   color: #a1ada3;
   font-size: 15px;
+}
+
+.restore-control {
+  display: grid;
+  justify-items: end;
+  gap: 5px;
+}
+
+.restore-warning {
+  color: #d78065;
+  font: 650 8px/1.2 ui-monospace, 'SFMono-Regular', Consolas, monospace;
+}
+
+.restore-button {
+  min-height: 30px;
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 0 9px;
+  border: 1px solid #764435;
+  border-radius: 3px;
+  background: #1b1412;
+  color: #f08a6b;
+  font: 600 10px/1.2 ui-monospace, 'SFMono-Regular', Consolas, monospace;
+  cursor: pointer;
+  transition: background 160ms ease, border-color 160ms ease, transform 160ms ease;
+}
+
+.restore-button:not(:disabled):hover {
+  transform: translateY(-1px);
+  border-color: #ba6349;
+  background: #35201a;
+}
+
+.restore-button:focus-visible {
+  outline: 2px solid #f08a6b;
+  outline-offset: 3px;
+}
+
+.restore-button:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+
+.warning-mark {
+  width: 15px;
+  height: 15px;
+  display: grid;
+  place-items: center;
+  border: 1px solid #a85840;
+  border-radius: 50%;
+  font: 800 9px/1 ui-monospace, monospace;
+}
+
+.restore-message {
+  max-width: 380px;
+  color: #f08a6b;
+  font: 10px/1.5 ui-monospace, 'SFMono-Regular', Consolas, monospace;
+  text-align: right;
+  overflow-wrap: anywhere;
 }
 
 .analysis-section {
@@ -707,8 +804,16 @@ h1 span {
     gap: 12px;
   }
 
+  .restore-control {
+    justify-items: start;
+  }
+
   .footer-location {
     padding-bottom: 0;
+  }
+
+  .restore-message {
+    text-align: left;
   }
 
   .approval-panel {

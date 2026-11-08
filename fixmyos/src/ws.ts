@@ -31,6 +31,14 @@ type MockProcess = {
 	commands: string[]
 }
 
+type RestoreResponse = {
+	success?: boolean
+	stdout?: string
+	stderr?: string
+	error?: string
+	message?: string
+}
+
 const nemotron = new Nemotron()
 export const developmentMockMode =
 	import.meta.env.DEV && new URLSearchParams(window.location.search).get('mock-ai') === '1'
@@ -97,6 +105,31 @@ export function startMockRecoveryWorkflow(onState: StateListener): void {
 	mockCommandIndex = 0
 	commandHistory = []
 	showMockStep()
+}
+
+export async function restoreStartupBackup(): Promise<RestoreResponse> {
+	if (mockMode) {
+		return {
+			success: true,
+			stdout: 'Development preview only. No system files were restored.',
+			stderr: '',
+		}
+	}
+
+	return new Promise((resolve, reject) => {
+		const timeout = window.setTimeout(() => {
+			reject(new Error('Timed out waiting for the startup restore acknowledgement.'))
+		}, 120_000)
+
+		socket.emit('restore_backup', { target: 'startup' }, (response: RestoreResponse) => {
+			window.clearTimeout(timeout)
+			if (response?.success) {
+				resolve(response)
+				return
+			}
+			reject(new Error(response?.stderr || response?.error || response?.message || 'Startup restore failed.'))
+		})
+	})
 }
 
 export async function respondToCommand(approved: boolean): Promise<void> {
