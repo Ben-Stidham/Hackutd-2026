@@ -1,4 +1,6 @@
 use std::env;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -7,9 +9,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::daemon::log_message;
 
-pub const STARTUP_BACKUP_NAME: &str = "error_detection_startup_backup";
-pub const MANUAL_BACKUP_NAME: &str = "error_detection_manual_backup";
-pub const DEFAULT_SNAPSHOT_SIZE: &str = "5G";
+pub const DEFAULT_BACKUP_ROOT: &str = "/var/backups/error_detection";
+pub const DEFAULT_SOURCE_ROOT: &str = "/";
+pub const STARTUP_SLOT_DIR: &str = "startup";
+pub const MANUAL_SLOT_DIR: &str = "manual";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -19,10 +22,10 @@ pub enum BackupSlot {
 }
 
 impl BackupSlot {
-    pub fn snapshot_name(self) -> &'static str {
+    pub fn dir_name(self) -> &'static str {
         match self {
-            BackupSlot::Startup => STARTUP_BACKUP_NAME,
-            BackupSlot::Manual => MANUAL_BACKUP_NAME,
+            BackupSlot::Startup => STARTUP_SLOT_DIR,
+            BackupSlot::Manual => MANUAL_SLOT_DIR,
         }
     }
 
@@ -32,6 +35,20 @@ impl BackupSlot {
             BackupSlot::Manual => "manual",
         }
     }
+
+    pub fn other(self) -> Self {
+        match self {
+            BackupSlot::Startup => BackupSlot::Manual,
+            BackupSlot::Manual => BackupSlot::Startup,
+        }
+    }
+
+    fn timestamp_filename(self) -> &'static str {
+        match self {
+            BackupSlot::Startup => ".startup_timestamp",
+            BackupSlot::Manual => ".manual_timestamp",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -39,8 +56,8 @@ pub struct BackupOperationResult {
     pub success: bool,
     pub action: String,
     pub slot: String,
-    pub snapshot_name: String,
-    pub origin_lv: String,
+    pub backup_path: String,
+    pub source_path: String,
     pub timestamp: u64,
     pub exit_code: i32,
     pub stdout: String,
@@ -54,112 +71,131 @@ struct BackupTimestamps {
 }
 
 pub struct BackupManager {
-    configured_lv: Option<String>,
-    snapshot_size: String,
+    backup_root: PathBuf,
+    source_root: PathBuf,
     state: Mutex<BackupTimestamps>,
+    op_lock: Mutex<()>,
 }
 
 impl BackupManager {
-    pub fn new(configured_lv: Option<String>, snapshot_size: Option<String>) -> Self {
-        let lv = configured_lv.or_else(|| env::var("ERROR_DETECTION_LV_PATH").ok());
-        let size = snapshot_size
-            .or_else(|| env::var("ERROR_DETECTION_SNAPSHOT_SIZE").ok())
-            .unwrap_or_else(|| DEFAULT_SNAPSHOT_SIZE.to_string());
+    pub fn new(backup_root: Option<PathBuf>, source_root: Option<PathBuf>) -> Self {
+        let root = backup_root
+            .or_else(|| env::var("ERROR_DETECTION_BACKUP_DIR").ok().map(PathBuf::from))
+            .unwrap_or_else(|| PathBuf::from(DEFAULT_BACKUP_ROOT));
+
+        let src = source_root
+            .or_else(|| env::var("ERROR_DETECTION_BACKUP_SOURCE").ok().map(PathBuf::from))
+            .unwrap_or_else(|| PathBuf::from(DEFAULT_SOURCE_ROOT));
+
+        let startup_ts = read_slot_timestamp(&root, BackupSlot::Startup);
+        let manual_ts = read_slot_timestamp(&root, BackupSlot::Manual);
 
         Self {
-            configured_lv: lv,
-            snapshot_size: size,
-            state: Mutex::new(BackupTimestamps::default()),
+            backup_root: root,
+            source_root: src,
+            state: Mutex::new(BackupTimestamps {
+                startup_ts,
+                manual_ts,
+            }),
+            op_lock: Mutex::new(()),
         }
     }
 
-    /// Creates the startup backup (`error_detection_startup_backup`), replacing any previous startup backup.
+    /// Creates the startup backup (`/var/backups/error_detection/startup`),
+    /// replacing any startup backup from the previous startup.
     pub fn create_startup_backup(&self) -> BackupOperationResult {
-        self.create_snapshot(BackupSlot::Startup)
+        self.create_rsync_backup(BackupSlot::Startup)
     }
 
-    /// Creates the server-triggered backup (`error_detection_manual_backup`), overwriting any previous server-triggered backup.
+    /// Creates the server-triggered backup (`/var/backups/error_detection/manual`),
+    /// overwriting the backup from the previous time the server was called.
     pub fn create_manual_backup(&self) -> BackupOperationResult {
-        self.create_snapshot(BackupSlot::Manual)
+        self.create_rsync_backup(BackupSlot::Manual)
     }
 
-    fn create_snapshot(&self, slot: BackupSlot) -> BackupOperationResult {
+    fn create_rsync_backup(&self, slot: BackupSlot) -> BackupOperationResult {
+        let _guard = self.op_lock.lock().ok();
         let now = current_unix_ts();
-        let snap_name = slot.snapshot_name();
+        let slot_dir = self.slot_path(slot);
+        let other_dir = self.slot_path(slot.other());
 
-        let Some((vg_name, lv_name)) = self.resolve_origin_lv() else {
-            let msg = "Could not detect an active LVM logical volume. Set ERROR_DETECTION_LV_PATH=<vg>/<lv> or --lv-path.";
-            log_message(&format!("Backup ({}) skipped/failed: {msg}", slot.label()));
+        if let Err(err) = fs::create_dir_all(&slot_dir) {
+            let msg = format!(
+                "Failed to create backup directory {}: {err}",
+                slot_dir.display()
+            );
+            log_message(&msg);
             return BackupOperationResult {
                 success: false,
                 action: "create_backup".to_string(),
                 slot: slot.label().to_string(),
-                snapshot_name: snap_name.to_string(),
-                origin_lv: String::new(),
+                backup_path: slot_dir.display().to_string(),
+                source_path: self.source_root.display().to_string(),
                 timestamp: now,
                 exit_code: -1,
                 stdout: String::new(),
-                stderr: msg.to_string(),
+                stderr: msg,
             };
-        };
-
-        let origin_path = format!("{vg_name}/{lv_name}");
-        let snap_path = format!("{vg_name}/{snap_name}");
-
-        // Remove previous snapshot in this slot if it exists so we overwrite it cleanly
-        if snapshot_exists(&vg_name, snap_name) {
-            log_message(&format!("Removing previous {} snapshot {snap_path}...", slot.label()));
-            let _ = Command::new("lvremove")
-                .args(["-f", &snap_path])
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status();
         }
 
-        // Also enforce at most 2 backups by removing any stale snapshots beyond the 2 managed slots
-        self.prune_extra_snapshots(&vg_name);
+        // Enforce at most 2 backups by removing any unexpected directories in backup_root
+        self.prune_extra_backup_dirs();
 
-        log_message(&format!(
-            "Creating {} LVM snapshot '{snap_name}' (size {}) from '{origin_path}'...",
-            slot.label(),
-            self.snapshot_size
-        ));
+        let src_arg = ensure_trailing_slash(&self.source_root);
+        let dst_arg = ensure_trailing_slash(&slot_dir);
 
-        match Command::new("lvcreate")
-            .args([
-                "--snapshot",
-                "--name",
-                snap_name,
-                "--size",
-                &self.snapshot_size,
-                &origin_path,
-            ])
+        let mut cmd = Command::new("rsync");
+        cmd.args(["-aAX", "--delete", "--numeric-ids"]);
+        if self.source_root != Path::new("/") {
+            cmd.arg("--checksum");
+        }
+
+        for pattern in Self::exclude_patterns(&self.source_root, &self.backup_root) {
+            cmd.arg(format!("--exclude={pattern}"));
+        }
+
+        // If the other backup slot already exists, use --link-dest so unchanged files are hard-linked
+        if other_dir.is_dir() && slot_exists(&self.backup_root, slot.other()) {
+            cmd.arg(format!("--link-dest={}", other_dir.display()));
+        }
+
+        cmd.arg(&src_arg)
+            .arg(&dst_arg)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()
-        {
+            .stderr(Stdio::piped());
+
+        log_message(&format!(
+            "Creating {} rsync backup from '{}' to '{}'...",
+            slot.label(),
+            src_arg,
+            dst_arg
+        ));
+
+        match cmd.output() {
             Ok(output) => {
                 let exit_code = output.status.code().unwrap_or(-1);
                 let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
                 let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-                let success = output.status.success();
+                // rsync exit code 0 = success, 24 = partial transfer due to vanished source files (normal on live /)
+                let success = exit_code == 0 || exit_code == 24;
 
                 if success {
-                    if let Ok(mut guard) = self.state.lock() {
+                    write_slot_timestamp(&self.backup_root, slot, now);
+                    if let Ok(mut st) = self.state.lock() {
                         match slot {
-                            BackupSlot::Startup => guard.startup_ts = Some(now),
-                            BackupSlot::Manual => guard.manual_ts = Some(now),
+                            BackupSlot::Startup => st.startup_ts = Some(now),
+                            BackupSlot::Manual => st.manual_ts = Some(now),
                         }
                     }
                     log_message(&format!(
-                        "Successfully created {} backup '{snap_path}'",
-                        slot.label()
+                        "Successfully created {} rsync backup at '{}'",
+                        slot.label(),
+                        slot_dir.display()
                     ));
                 } else {
                     log_message(&format!(
-                        "Failed to create {} backup '{snap_path}' (exit={exit_code}): {stderr}",
+                        "Failed to create {} rsync backup (exit={exit_code}): {stderr}",
                         slot.label()
                     ));
                 }
@@ -168,8 +204,8 @@ impl BackupManager {
                     success,
                     action: "create_backup".to_string(),
                     slot: slot.label().to_string(),
-                    snapshot_name: snap_name.to_string(),
-                    origin_lv: origin_path,
+                    backup_path: slot_dir.display().to_string(),
+                    source_path: self.source_root.display().to_string(),
                     timestamp: now,
                     exit_code,
                     stdout,
@@ -180,89 +216,81 @@ impl BackupManager {
                 success: false,
                 action: "create_backup".to_string(),
                 slot: slot.label().to_string(),
-                snapshot_name: snap_name.to_string(),
-                origin_lv: origin_path,
+                backup_path: slot_dir.display().to_string(),
+                source_path: self.source_root.display().to_string(),
                 timestamp: now,
                 exit_code: -1,
                 stdout: String::new(),
-                stderr: format!("Failed to execute lvcreate: {err}"),
+                stderr: format!("Failed to execute rsync: {err}"),
             },
         }
     }
 
-    /// Restores a backup using `lvconvert --merge`.
+    /// Restores a backup using `rsync` back to the source root (`/`).
     /// Defaults to restoring the most recent backup unless `requested_target` specifies `"startup"` or `"manual"`.
     pub fn restore_backup(&self, requested_target: Option<&str>) -> BackupOperationResult {
+        let _guard = self.op_lock.lock().ok();
         let now = current_unix_ts();
 
-        let Some((vg_name, lv_name)) = self.resolve_origin_lv() else {
-            let msg = "Could not detect an active LVM logical volume to restore.";
+        let Some(slot) = self.select_restore_slot(requested_target) else {
             return BackupOperationResult {
                 success: false,
                 action: "restore_backup".to_string(),
                 slot: "none".to_string(),
-                snapshot_name: String::new(),
-                origin_lv: String::new(),
+                backup_path: String::new(),
+                source_path: self.source_root.display().to_string(),
                 timestamp: now,
                 exit_code: -1,
                 stdout: String::new(),
-                stderr: msg.to_string(),
+                stderr: "No matching rsync backup found to restore".to_string(),
             };
         };
 
-        let origin_path = format!("{vg_name}/{lv_name}");
-        let slot = match self.select_restore_slot(&vg_name, requested_target) {
-            Some(s) => s,
-            None => {
-                return BackupOperationResult {
-                    success: false,
-                    action: "restore_backup".to_string(),
-                    slot: "none".to_string(),
-                    snapshot_name: String::new(),
-                    origin_lv: origin_path,
-                    timestamp: now,
-                    exit_code: -1,
-                    stdout: String::new(),
-                    stderr: "No matching LVM backup snapshot found to restore".to_string(),
-                };
-            }
-        };
+        let slot_dir = self.slot_path(slot);
+        let src_arg = ensure_trailing_slash(&slot_dir);
+        let dst_arg = ensure_trailing_slash(&self.source_root);
 
-        let snap_name = slot.snapshot_name();
-        let snap_path = format!("{vg_name}/{snap_name}");
+        let mut cmd = Command::new("rsync");
+        cmd.args(["-aAX", "--delete", "--numeric-ids"]);
+        if self.source_root != Path::new("/") {
+            cmd.arg("--checksum");
+        }
 
-        log_message(&format!(
-            "Restoring {} LVM snapshot '{snap_path}' into '{origin_path}'...",
-            slot.label()
-        ));
+        for pattern in Self::exclude_patterns(&self.source_root, &self.backup_root) {
+            cmd.arg(format!("--exclude={pattern}"));
+        }
 
-        match Command::new("lvconvert")
-            .args(["--merge", &snap_path])
+        cmd.arg(&src_arg)
+            .arg(&dst_arg)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()
-        {
+            .stderr(Stdio::piped());
+
+        log_message(&format!(
+            "Restoring {} rsync backup from '{}' to '{}'...",
+            slot.label(),
+            src_arg,
+            dst_arg
+        ));
+
+        match cmd.output() {
             Ok(output) => {
                 let exit_code = output.status.code().unwrap_or(-1);
                 let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
                 let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-                let success = output.status.success();
+                let success = exit_code == 0 || exit_code == 24;
 
                 if success {
-                    // Merging consumes the snapshot LV
-                    if let Ok(mut guard) = self.state.lock() {
-                        match slot {
-                            BackupSlot::Startup => guard.startup_ts = None,
-                            BackupSlot::Manual => guard.manual_ts = None,
-                        }
-                    }
                     log_message(&format!(
-                        "Successfully scheduled/completed merge of '{snap_path}'"
+                        "Successfully restored {} backup from '{}'",
+                        slot.label(),
+                        slot_dir.display()
                     ));
                 } else {
                     log_message(&format!(
-                        "Failed to restore '{snap_path}' (exit={exit_code}): {stderr}"
+                        "Failed to restore {} backup from '{}' (exit={exit_code}): {stderr}",
+                        slot.label(),
+                        slot_dir.display()
                     ));
                 }
 
@@ -270,8 +298,8 @@ impl BackupManager {
                     success,
                     action: "restore_backup".to_string(),
                     slot: slot.label().to_string(),
-                    snapshot_name: snap_name.to_string(),
-                    origin_lv: origin_path,
+                    backup_path: slot_dir.display().to_string(),
+                    source_path: self.source_root.display().to_string(),
                     timestamp: now,
                     exit_code,
                     stdout,
@@ -282,100 +310,92 @@ impl BackupManager {
                 success: false,
                 action: "restore_backup".to_string(),
                 slot: slot.label().to_string(),
-                snapshot_name: snap_name.to_string(),
-                origin_lv: origin_path,
+                backup_path: slot_dir.display().to_string(),
+                source_path: self.source_root.display().to_string(),
                 timestamp: now,
                 exit_code: -1,
                 stdout: String::new(),
-                stderr: format!("Failed to execute lvconvert: {err}"),
+                stderr: format!("Failed to execute rsync: {err}"),
             },
         }
     }
 
-    pub fn select_restore_slot(
-        &self,
-        vg_name: &str,
-        requested_target: Option<&str>,
-    ) -> Option<BackupSlot> {
-        let startup_exists = snapshot_exists(vg_name, STARTUP_BACKUP_NAME);
-        let manual_exists = snapshot_exists(vg_name, MANUAL_BACKUP_NAME);
+    pub fn select_restore_slot(&self, requested_target: Option<&str>) -> Option<BackupSlot> {
+        let startup_exists = slot_exists(&self.backup_root, BackupSlot::Startup);
+        let manual_exists = slot_exists(&self.backup_root, BackupSlot::Manual);
 
         let guard = self.state.lock().ok()?;
+        let startup_ts = guard
+            .startup_ts
+            .or_else(|| read_slot_timestamp(&self.backup_root, BackupSlot::Startup));
+        let manual_ts = guard
+            .manual_ts
+            .or_else(|| read_slot_timestamp(&self.backup_root, BackupSlot::Manual));
+
         choose_slot_with_state(
             requested_target,
-            guard.startup_ts,
-            guard.manual_ts,
+            startup_ts,
+            manual_ts,
             startup_exists,
             manual_exists,
         )
     }
 
-    fn resolve_origin_lv(&self) -> Option<(String, String)> {
-        if let Some(ref cfg) = self.configured_lv {
-            if let Some(pair) = parse_vg_lv(cfg) {
-                return Some(pair);
-            }
-        }
-
-        // Try discovering via `lvs --noheadings -o vg_name,lv_name,lv_attr`
-        // selecting the first non-snapshot origin/standard volume
-        let output = Command::new("lvs")
-            .args(["--noheadings", "--separator", ":", "-o", "vg_name,lv_name,lv_attr"])
-            .stdin(Stdio::null())
-            .stderr(Stdio::null())
-            .output()
-            .ok()?;
-
-        if !output.status.success() {
-            return None;
-        }
-
-        let text = String::from_utf8_lossy(&output.stdout);
-        for line in text.lines() {
-            let parts: Vec<&str> = line.trim().split(':').collect();
-            if parts.len() >= 3 {
-                let vg = parts[0].trim();
-                let lv = parts[1].trim();
-                let attr = parts[2].trim();
-                // Skip snapshot volumes (attr starts with 's' or 'S') and our own backup names
-                if !attr.starts_with('s')
-                    && !attr.starts_with('S')
-                    && lv != STARTUP_BACKUP_NAME
-                    && lv != MANUAL_BACKUP_NAME
-                {
-                    return Some((vg.to_string(), lv.to_string()));
-                }
-            }
-        }
-        None
+    fn slot_path(&self, slot: BackupSlot) -> PathBuf {
+        self.backup_root.join(slot.dir_name())
     }
 
-    fn prune_extra_snapshots(&self, vg_name: &str) {
-        let Ok(output) = Command::new("lvs")
-            .args(["--noheadings", "--separator", ":", "-o", "vg_name,lv_name,lv_attr"])
-            .stdin(Stdio::null())
-            .stderr(Stdio::null())
-            .output()
-        else {
+    fn exclude_patterns(source_root: &Path, backup_root: &Path) -> Vec<String> {
+        if source_root != Path::new("/") {
+            if let Ok(rel) = backup_root.strip_prefix(source_root) {
+                return vec![format!("/{}/**", rel.display())];
+            }
+            return Vec::new();
+        }
+
+        let mut patterns = vec![
+            "/dev/*".to_string(),
+            "/proc/*".to_string(),
+            "/sys/*".to_string(),
+            "/tmp/*".to_string(),
+            "/run/*".to_string(),
+            "/mnt/*".to_string(),
+            "/media/*".to_string(),
+            "/lost+found".to_string(),
+            "/home/*".to_string(),
+            "/var/backups/error_detection/**".to_string(),
+            "/var/cache/**".to_string(),
+            "/var/tmp/**".to_string(),
+            "/var/lib/libvirt/**".to_string(),
+            "/var/lib/docker/**".to_string(),
+            "/var/lib/containers/**".to_string(),
+            "/swapfile".to_string(),
+        ];
+        let custom_root = format!("{}/**", backup_root.display());
+        if !patterns.contains(&custom_root) {
+            patterns.push(custom_root);
+        }
+        patterns
+    }
+
+    fn prune_extra_backup_dirs(&self) {
+        let Ok(entries) = fs::read_dir(&self.backup_root) else {
             return;
         };
-        let text = String::from_utf8_lossy(&output.stdout);
-        for line in text.lines() {
-            let parts: Vec<&str> = line.trim().split(':').collect();
-            if parts.len() >= 3 {
-                let vg = parts[0].trim();
-                let lv = parts[1].trim();
-                if vg == vg_name
-                    && lv.starts_with("error_detection_")
-                    && lv != STARTUP_BACKUP_NAME
-                    && lv != MANUAL_BACKUP_NAME
-                {
-                    let _ = Command::new("lvremove")
-                        .args(["-f", &format!("{vg}/{lv}")])
-                        .stdin(Stdio::null())
-                        .stdout(Stdio::null())
-                        .stderr(Stdio::null())
-                        .status();
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(name_str) = name.to_str() else {
+                continue;
+            };
+            if name_str != STARTUP_SLOT_DIR
+                && name_str != MANUAL_SLOT_DIR
+                && !name_str.starts_with('.')
+            {
+                let path = entry.path();
+                if path.is_dir() {
+                    let _ = fs::remove_dir_all(path);
+                } else {
+                    let _ = fs::remove_file(path);
                 }
             }
         }
@@ -391,15 +411,15 @@ pub fn choose_slot_with_state(
 ) -> Option<BackupSlot> {
     if let Some(raw) = requested_target.map(str::trim).filter(|s| !s.is_empty()) {
         match raw.to_ascii_lowercase().as_str() {
-            "startup" | "boot" | STARTUP_BACKUP_NAME => {
-                return if startup_exists || startup_ts.is_some() {
+            "startup" | "boot" => {
+                return if startup_exists {
                     Some(BackupSlot::Startup)
                 } else {
                     None
                 };
             }
-            "manual" | "server" | "user" | MANUAL_BACKUP_NAME => {
-                return if manual_exists || manual_ts.is_some() {
+            "manual" | "server" | "user" => {
+                return if manual_exists {
                     Some(BackupSlot::Manual)
                 } else {
                     None
@@ -413,12 +433,12 @@ pub fn choose_slot_with_state(
     let eff_manual = if manual_exists {
         Some(manual_ts.unwrap_or(1))
     } else {
-        manual_ts
+        None
     };
     let eff_startup = if startup_exists {
         Some(startup_ts.unwrap_or(0))
     } else {
-        startup_ts
+        None
     };
 
     match (eff_manual, eff_startup) {
@@ -435,34 +455,32 @@ pub fn choose_slot_with_state(
     }
 }
 
-pub fn parse_vg_lv(input: &str) -> Option<(String, String)> {
-    let trimmed = input.trim();
-    if let Some(mapper) = trimmed.strip_prefix("/dev/mapper/") {
-        let (vg, lv) = mapper.split_once('-')?;
-        if !vg.is_empty() && !lv.is_empty() {
-            return Some((vg.to_string(), lv.to_string()));
-        }
-    }
-    let clean = trimmed.strip_prefix("/dev/").unwrap_or(trimmed);
-    let (vg, lv) = clean.split_once('/')?;
-    if !vg.is_empty() && !lv.is_empty() && !lv.contains('/') {
-        Some((vg.to_string(), lv.to_string()))
-    } else {
-        None
-    }
+fn slot_exists(backup_root: &Path, slot: BackupSlot) -> bool {
+    let dir = backup_root.join(slot.dir_name());
+    dir.is_dir() && read_slot_timestamp(backup_root, slot).is_some()
 }
 
-fn snapshot_exists(vg_name: &str, snap_name: &str) -> bool {
-    let Ok(status) = Command::new("lvs")
-        .arg(format!("{vg_name}/{snap_name}"))
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-    else {
-        return false;
-    };
-    status.success()
+fn write_slot_timestamp(backup_root: &Path, slot: BackupSlot, ts: u64) {
+    let ts_path = backup_root.join(slot.timestamp_filename());
+    let _ = fs::write(ts_path, format!("{ts}\n"));
+}
+
+fn read_slot_timestamp(backup_root: &Path, slot: BackupSlot) -> Option<u64> {
+    let ts_path = backup_root.join(slot.timestamp_filename());
+    fs::read_to_string(ts_path)
+        .ok()?
+        .trim()
+        .parse::<u64>()
+        .ok()
+}
+
+fn ensure_trailing_slash(path: &Path) -> String {
+    let s = path.display().to_string();
+    if s.ends_with('/') {
+        s
+    } else {
+        format!("{s}/")
+    }
 }
 
 fn current_unix_ts() -> u64 {
@@ -477,43 +495,67 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_parse_vg_lv() {
-        assert_eq!(
-            parse_vg_lv("vg0/root"),
-            Some(("vg0".to_string(), "root".to_string()))
-        );
-        assert_eq!(
-            parse_vg_lv("/dev/vg0/root"),
-            Some(("vg0".to_string(), "root".to_string()))
-        );
-        assert_eq!(
-            parse_vg_lv("/dev/mapper/vg0-root"),
-            Some(("vg0".to_string(), "root".to_string()))
-        );
-    }
-
-    #[test]
     fn test_choose_slot_with_state_defaults_to_most_recent() {
-        // Only startup exists
         assert_eq!(
             choose_slot_with_state(None, Some(100), None, true, false),
             Some(BackupSlot::Startup)
         );
-        // Both exist, manual is newer (created after startup)
         assert_eq!(
             choose_slot_with_state(None, Some(100), Some(200), true, true),
             Some(BackupSlot::Manual)
         );
-        // Both exist, but caller explicitly requests "startup"
         assert_eq!(
             choose_slot_with_state(Some("startup"), Some(100), Some(200), true, true),
             Some(BackupSlot::Startup)
         );
-        // Both exist, caller explicitly requests "manual"
         assert_eq!(
             choose_slot_with_state(Some("manual"), Some(300), Some(200), true, true),
             Some(BackupSlot::Manual)
         );
     }
-}
 
+    #[test]
+    fn test_rsync_backup_and_restore_end_to_end() {
+        let base = PathBuf::from(format!("/tmp/test_rsync_backup_{}", std::process::id()));
+        let src_dir = base.join("src");
+        let backup_root = base.join("backups");
+        let _ = fs::remove_dir_all(&base);
+
+        fs::create_dir_all(&src_dir).expect("create src");
+        fs::write(src_dir.join("config.txt"), "v1-startup").expect("write v1");
+
+        let bm = BackupManager::new(Some(backup_root.clone()), Some(src_dir.clone()));
+
+        // 1. Create startup backup (v1-startup)
+        let res_startup = bm.create_startup_backup();
+        assert!(res_startup.success);
+        assert_eq!(res_startup.slot, "startup");
+
+        // 2. Modify source and create manual backup (v2-manual)
+        fs::write(src_dir.join("config.txt"), "v2-manual").expect("write v2");
+        let res_manual = bm.create_manual_backup();
+        assert!(res_manual.success);
+        assert_eq!(res_manual.slot, "manual");
+
+        // 3. Corrupt source (v3-broken) and restore default (most recent -> manual -> v2-manual)
+        fs::write(src_dir.join("config.txt"), "v3-broken").expect("write v3");
+        let res_restore_latest = bm.restore_backup(None);
+        assert!(res_restore_latest.success);
+        assert_eq!(res_restore_latest.slot, "manual");
+        assert_eq!(
+            fs::read_to_string(src_dir.join("config.txt")).unwrap(),
+            "v2-manual"
+        );
+
+        // 4. Explicitly restore startup backup (v1-startup)
+        let res_restore_startup = bm.restore_backup(Some("startup"));
+        assert!(res_restore_startup.success);
+        assert_eq!(res_restore_startup.slot, "startup");
+        assert_eq!(
+            fs::read_to_string(src_dir.join("config.txt")).unwrap(),
+            "v1-startup"
+        );
+
+        let _ = fs::remove_dir_all(&base);
+    }
+}

@@ -44,8 +44,8 @@ struct Config {
     log_file: PathBuf,
     db_file: PathBuf,
     port: u16,
-    lv_path: Option<String>,
-    snapshot_size: Option<String>,
+    backup_dir: Option<PathBuf>,
+    backup_source: Option<PathBuf>,
     ignored_comms: HashSet<String>,
 }
 
@@ -65,13 +65,16 @@ impl Config {
             .ok()
             .and_then(|v| v.parse::<u16>().ok())
             .unwrap_or(DEFAULT_PORT);
-        let mut lv_path = env::var("ERROR_DETECTION_LV_PATH").ok();
-        let mut snapshot_size = env::var("ERROR_DETECTION_SNAPSHOT_SIZE").ok();
-        let mut ignored_comms: HashSet<String> =
-            ["journalctl", "lvs", "lvcreate", "lvremove", "lvconvert"]
-                .into_iter()
-                .map(String::from)
-                .collect();
+        let mut backup_dir = env::var("ERROR_DETECTION_BACKUP_DIR")
+            .ok()
+            .map(PathBuf::from);
+        let mut backup_source = env::var("ERROR_DETECTION_BACKUP_SOURCE")
+            .ok()
+            .map(PathBuf::from);
+        let mut ignored_comms: HashSet<String> = ["journalctl", "rsync"]
+            .into_iter()
+            .map(String::from)
+            .collect();
 
         let mut args = env::args().skip(1);
         while let Some(arg) = args.next() {
@@ -108,17 +111,17 @@ impl Config {
                         .parse::<u16>()
                         .map_err(|_| format!("Invalid port number: '{val}'"))?;
                 }
-                "--lv-path" => {
+                "--backup-dir" => {
                     let val = args
                         .next()
-                        .ok_or_else(|| "--lv-path requires a VG/LV path argument".to_string())?;
-                    lv_path = Some(val);
+                        .ok_or_else(|| "--backup-dir requires a path argument".to_string())?;
+                    backup_dir = Some(PathBuf::from(val));
                 }
-                "--snapshot-size" => {
+                "--backup-source" => {
                     let val = args
                         .next()
-                        .ok_or_else(|| "--snapshot-size requires a size argument (e.g. 5G)".to_string())?;
-                    snapshot_size = Some(val);
+                        .ok_or_else(|| "--backup-source requires a path argument".to_string())?;
+                    backup_source = Some(PathBuf::from(val));
                 }
                 "--ignore" => {
                     let val = args
@@ -140,8 +143,8 @@ impl Config {
             log_file,
             db_file,
             port,
-            lv_path,
-            snapshot_size,
+            backup_dir,
+            backup_source,
             ignored_comms,
         })
     }
@@ -168,16 +171,16 @@ OPTIONS:
     --log-file <PATH>       Path to log file (default: {DEFAULT_LOG_FILE})
     --db-file <PATH>        Path to SQLite database (default: {DEFAULT_DB_FILE})
     --port <PORT>           Localhost Socket.IO server port (default: {DEFAULT_PORT})
-    --lv-path <VG/LV>       LVM volume to snapshot for backups (auto-detected if omitted)
-    --snapshot-size <SIZE>  LVM snapshot size for lvcreate (default: 5G)
+    --backup-dir <PATH>     Directory for rsync backup slots (default: /var/backups/error_detection)
+    --backup-source <PATH>  Source root to back up via rsync (default: /)
     --ignore <COMM,...>     Comma-separated process names to ignore
 
 SOCKET.IO EVENTS (http://127.0.0.1:{DEFAULT_PORT}):
     list_errors / get_errors / list  Returns list of all failed processes (id, process_name, error_code)
     get_error / get                  Given id (or ids), returns full stored details for that failed process
     run_command / run                Executes a command string and returns exit_code, stdout, and stderr
-    create_backup / backup           Creates/overwrites the server-triggered LVM snapshot backup
-    restore_backup / restore         Restores the most recent LVM snapshot backup (unless target specified)
+    create_backup / backup           Creates/overwrites the server-triggered rsync backup
+    restore_backup / restore         Restores the most recent rsync backup (unless target specified)
 
 PERMISSIONS:
     Monitoring all system-wide process exits via the Linux Netlink Proc Connector
@@ -389,11 +392,16 @@ fn run_monitor_loop(config: &Config, is_daemon: bool) -> ExitCode {
     let mut output_collector = OutputCollector::new(self_pid as u32);
 
     let backup_manager = Arc::new(BackupManager::new(
-        config.lv_path.clone(),
-        config.snapshot_size.clone(),
+        config.backup_dir.clone(),
+        config.backup_source.clone(),
     ));
     // Always create the startup backup on program startup, replacing any startup backup from prior runs
-    let _ = backup_manager.create_startup_backup();
+    {
+        let bm_startup = Arc::clone(&backup_manager);
+        std::thread::spawn(move || {
+            let _ = bm_startup.create_startup_backup();
+        });
+    }
 
     let _socketio_server = match SocketIoServerHandle::start(
         config.port,

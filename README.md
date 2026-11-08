@@ -2,6 +2,6 @@
 
 ## Dependencies
 
-- `lvm2`
+- `rsync`
 - `sqlite`
 
