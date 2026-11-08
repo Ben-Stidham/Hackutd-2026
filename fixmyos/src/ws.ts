@@ -155,9 +155,9 @@ export async function respondToCommand(approved: boolean): Promise<void> {
 		const answer = await nemotron.ask(
 			`${agentInstructions}\n\nCommand result:\n${promptJson(result, 10_000)}\n\n` +
 				'Continue analyzing this process. Start with a short `### Situation` section explaining what is happening and what you are doing. ' +
-				'Use level-two headings in the required format for commands; these command headings are the plan shown to the user. ' +
-				'Keep execution sequential: provide only the next justified command and wait for its result before naming another command. ' +
-				'If no more commands are needed for this process, include the exact heading ## DONE.',
+				'For the next step, put exactly one shell command on a line beginning with `## `; do not include any later commands. ' +
+				'When no more action is required, end with the exact text `FIX COMPLETE` on its own line. ' +
+				'Do not put the command heading in a code fence.',
 		)
 		await showModelStep(answer)
 	} catch (error) {
@@ -289,9 +289,9 @@ async function loadCurrentProcess(): Promise<void> {
 			`${agentInstructions}\n\nAdditional information for process ID ${processId}:\n` +
 				`${promptJson(details)}\n\n` +
 				'Analyze this process and follow the required output format. Start with a short `### Situation` section explaining what is happening and what you are doing. ' +
-				'Use level-two headings in the required format for commands; these command headings are the plan shown to the user. ' +
-				'Keep execution sequential: provide only the next justified command and wait for its result before naming another command. ' +
-				'If no command is needed, include the exact heading ## DONE.',
+				'For the next step, put exactly one shell command on a line beginning with `## `; do not include any later commands. ' +
+				'When no more action is required, end with the exact text `FIX COMPLETE` on its own line. ' +
+				'Do not put the command heading in a code fence.',
 		)
 		await showModelStep(answer)
 	} catch (error) {
@@ -316,7 +316,7 @@ async function showModelStep(answer: string): Promise<void> {
 		updateState({
 			phase: 'error',
 			response: answer,
-			error: 'Nemotron did not include a command heading or the ## DONE marker.',
+			error: 'Nemotron did not include a command heading or the FIX COMPLETE marker.',
 			processNumber: currentProcessIndex + 1,
 			processCount: processIds.length,
 		})
@@ -381,9 +381,11 @@ function parseProcessIds(answer: string): string[] {
 function getNextCommand(
 	answer: string,
 ): { kind: 'command'; command: string } | { kind: 'done' } | { kind: 'missing' } {
+	if (/^(?:##\s*)?FIX COMPLETE\s*$/im.test(answer)) return { kind: 'done' }
+
 	const heading = answer.match(/^##\s+(.+?)\s*$/im)?.[1]?.trim()
 	if (!heading) return { kind: 'missing' }
-	if (/^(done|no more commands?)\b/i.test(heading)) return { kind: 'done' }
+	if (/^(?:done|no more commands?)\b/i.test(heading)) return { kind: 'missing' }
 
 	const command = heading.replace(/^`|`$/g, '').trim()
 	if (!command || /^<.*>$/.test(command)) return { kind: 'missing' }
