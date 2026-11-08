@@ -18,7 +18,8 @@ The format of these will be as follows:
 ```
 
 Determine which of them could be due to the system not functioning correctly  
-Return a list of IDs for which you'd like more information about. You would like more information about any process you think might be erroring  
+Return a list of IDs for which you'd like more information about. You would like more information about all processes in the list  
+This should just be a list of the ids specified above  
 Additional information will be returned in the format of:
 
 ```
@@ -50,7 +51,9 @@ This is to reduce the number of required calls
 Do not create a plan to fix until you have further investigated the error, if it is even necessary to fix  
 Upon creating the plan, return to the user a description of the error, and a list of separate commands on how to fix it  
 You are currently being ran as a system daemon. You cannot change directory, so all of your paths should be absolute  
-Attempt to do any analysis in the least number of commands possible  
+Attempt to do any analysis in the least number of commands possible
+If, in initial analysis, the error will not impact the everyday functionality of the system, mark it as `FIX COMPLETE` \
+Only attempt to fix errors that have the potential to impact system functionality
 
 ## Formatting:
 
@@ -85,4 +88,5 @@ For each further command:
 
 If at any point, you are told `COMMAND NOT APPROVED`, cease all further commands **For that pid**  
 You may then switch to a new PID to attempt to analyze and potentially fix  
-Upon finishing the attempted fix for a given PID, or if you determine that a fix is not necessary for a given PID, return `FIX COMPLETE`  
+Upon finishing the attempted fix for a given PID, or if you determine that a fix is not necessary for a given PID, return `FIX COMPLETE`
+
